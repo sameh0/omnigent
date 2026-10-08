@@ -41,6 +41,7 @@ from omnigent.entities import (
     NewConversationItem,
     ResourceEventData,
     SlashCommandData,
+    TerminalCommandData,
 )
 from omnigent.entities.conversation import (
     FunctionCallData,
@@ -798,6 +799,7 @@ async def _stop_host_runner_intentionally(
                 statuses.setdefault(related_id, None)
         statuses.setdefault(session_id, None)
         marked: set[str] = set()
+        stop_targets: set[str] = set()
         completed_stop_relays: dict[str, tuple[_RelayHandle, int]] = {}
         for related_id, persisted_status in statuses.items():
             handle = _runner_relay_tasks.get(related_id)
@@ -807,6 +809,7 @@ async def _stop_host_runner_intentionally(
             # Completed work and earlier task failures keep their existing outcome.
             if related_id != session_id and live_status not in (*_MID_TURN_STATUSES, None):
                 continue
+            stop_targets.add(related_id)
             if _intentional_stop_sessions.get(related_id) != runner_id:
                 marked.add(related_id)
             # Each Stop needs a fresh disconnect window, including repeated requests.
@@ -837,6 +840,30 @@ async def _stop_host_runner_intentionally(
                             handle.intentional_stop_turn_ended = True
                         else:
                             _intentional_stop_sessions.pop(related_id, None)
+        if acknowledged:
+            # Native forwarders can publish activity after the relay closes.
+            # The host acknowledgement confirms those publishers have exited.
+            for related_id in stop_targets:
+                if (
+                    _session_status_cache.get(related_id, statuses[related_id])
+                    not in _MID_TURN_STATUSES
+                ):
+                    continue
+                handle = _runner_relay_tasks.get(related_id)
+                if handle is not None and handle.runner_id != runner_id:
+                    continue
+                settled = await asyncio.wrap_future(
+                    session_live_state.submit(
+                        "settle_intentional_stop",
+                        conversation_store.settle_intentionally_stopped_session,
+                        related_id,
+                        runner_id,
+                    )
+                )
+                handle = _runner_relay_tasks.get(related_id)
+                if settled and (handle is None or handle.runner_id == runner_id):
+                    session_live_state.forget_live_status(related_id)
+                    _publish_status(related_id, "idle", persist_live_status=False)
         return acknowledged
 
 
@@ -2717,19 +2744,31 @@ def _native_mirror_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _shell_command_input(item: NewConversationItem) -> str | None:
+    """Return a mirrored shell input's command, excluding its output half."""
+    if (
+        item.type == "terminal_command"
+        and isinstance(item.data, TerminalCommandData)
+        and item.data.kind == "input"
+    ):
+        return item.data.input or None
+    return None
+
+
 def _drains_pending_inputs(item: NewConversationItem) -> bool:
     """
     Whether a mirrored item settles a queued web message.
 
-    True for a web-composer user message echoed back by the transcript and for
-    a slash command (typed in the web composer as plain text, mirrored as a
-    ``slash_command`` item). Assistant and tool items never touch the queue.
+    User messages, slash commands, and shell-command inputs can settle web
+    submissions. Assistant messages, tool items, and shell outputs cannot.
 
     :param item: The parsed external item.
     :returns: ``True`` when persisting *item* drains a pending-input entry.
     """
     if item.type == "slash_command":
         return isinstance(item.data, SlashCommandData)
+    if item.type == "terminal_command":
+        return _shell_command_input(item) is not None
     return (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -2955,6 +2994,10 @@ async def _persist_external_conversation_item_unlocked(
         if drained is not None:
             cleared_pending_id = drained.pending_id
         held_older = matched.skipped
+    elif (shell_command := _shell_command_input(item)) is not None:
+        drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
+        if drained is not None:
+            cleared_pending_id = drained.pending_id
     # Build the batch: skipped entries first (their positions must precede
     # the matched item to match broadcast order), then the anchor. Each
     # skipped entry gets a pair of items (user message + error) with stable
@@ -7019,8 +7062,38 @@ async def _forward_codex_side_chat_turn(
             "codex_side_thread_id": child_thread_id,
         },
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise _codex_side_chat_runner_error(resp)
     return _SessionEventDispatchResult(item_id=None, pending_id=None)
+
+
+def _codex_side_chat_runner_error(resp: httpx.Response) -> OmnigentError:
+    """
+    Translate a parent runner's refusal of a side-chat turn into a structured error.
+
+    :param resp: Non-2xx response from the parent runner's ``/events``.
+    :returns: An :class:`OmnigentError` carrying the runner's detail message.
+    """
+    detail: str | None = None
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            detail = payload["detail"]
+    except ValueError:
+        pass
+    if resp.status_code == 404:
+        code = ErrorCode.NOT_FOUND
+    elif resp.status_code == 409:
+        code = ErrorCode.CONFLICT
+        detail = detail or "Codex rejected this message."
+        if "multi-agent v2" in detail:
+            detail = f"This Codex sub-agent cannot take direct input ({detail})."
+    else:
+        code = ErrorCode.RUNNER_UNAVAILABLE
+    return OmnigentError(
+        detail or "The Codex side chat could not accept this message right now.",
+        code=code,
+    )
 
 
 async def _dispatch_session_event_to_runner_impl(

@@ -23,6 +23,8 @@ implements them separately, so a fix for one harness does not reach the others.
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `steer`: sending while the harness is mid-turn steers the active turn.
 - `chat-render`: the harness's output renders in chat like other harnesses.
+- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups
+  stay in that thread, and closing it leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
 - `disconnect`: startup waits and active operations settle when their native
@@ -71,6 +73,10 @@ shown for a newly connected or requested host → See more.
 turn, and Stop separately. For an offline host use the reconnect paths in
 [sessions](./sessions.md); a detached terminal has its own paths in
 [terminals](./terminals.md).
+
+**Codex side chat:** type `/side <question>` in the parent composer, send a
+follow-up in the side pane, then close its tab. The parent conversation stays
+separate. See [sessions](./sessions.md) for all side-chat entry points.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -123,6 +129,11 @@ the extra fields. Resolver and raw-tunnel checks:
 
 Cross-harness journeys:
 
+- **`side-chat`, Codex:**
+  `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
+  uses a real Codex CLI/app-server and the local mock model. It verifies inherited
+  model context, distinct native threads on one runner, transcript isolation,
+  follow-ups, and a working parent after side-chat closure.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus
@@ -223,6 +234,21 @@ Cross-harness journeys:
   `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_records_an_effort_its_config_write_lost`
   keeps a resumed effort whose config write failed for later updates.
 - **`chat-render`, `steer`, per harness:** use the matrix.
+- **`chat-render`, Claude shell commands from the web composer:**
+  `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`
+  drives the built SPA at desktop and phone widths with controlled backend
+  events. The shell prompt remains one user bubble after settlement, with its
+  output below it; a following prompt and reload preserve both user turns.
+  `tests/e2e_ui/messages/test_native_claude_shell_input.py::test_web_shell_command_settles_before_the_next_prompt`
+  covers the real CLI and transcript forwarder through the repro environment.
+  It requires Claude Code and tmux; machine-managed Claude settings need an
+  isolated container for the scripted model endpoint.
+- **`chat-render`, Claude shell commands from the agent terminal:**
+  `tests/browser_ui/chat/test_native_shell_settlement.py::test_terminal_shell_commands_keep_their_user_turns`
+  replays terminal-origin records in the built SPA at desktop and phone widths.
+  After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
+  prompt must remain a separate user turn outside the assistant's folded work,
+  including after reload. This browser contract does not launch the Claude CLI.
 - **`skill-contents`:** run `tests/host/test_skill_content.py`,
   `tests/server/routes/test_skill_content.py`, and the real-host test
   `tests/e2e/test_host_skill_content_e2e.py::test_host_skill_content` with plain
@@ -277,6 +303,14 @@ Cross-harness journeys:
   checks output recovery across a real server restart and injected stream-open
   failures. It supplies native-style events; it does not run a vendor CLI.
   Run with plain `uv run pytest` and the browser prerequisites in the skill.
+- **`disconnect`, completed Claude Task child (own environment):**
+  `tests/e2e_ui/sessions/test_claude_native_idle_handoff.py::test_completed_claude_child_survives_stale_status_handoff`
+  uses the real Claude CLI, native child forwarder, two server replicas, and a
+  runner tunnel cut. A completed child with stale saved `running` state must
+  not acquire a failure on the new replica, in its chat or the Agents panel,
+  including after reload. Run with plain `uv run pytest` and the browser
+  prerequisites in the skill. Requires Claude Code and tmux; machine-managed
+  Claude credentials need an isolated container for the scripted model endpoint.
 
 - **`plugin-inventory` (component and host tests):**
   `tests/e2e/test_host_plugins_e2e.py::test_host_plugin_inventory` starts a real
