@@ -1,0 +1,81 @@
+# Fork-only: publish this fork's server image to ghcr.io/<owner>/omnigent-server.
+#
+# Lives only on the `ci` branch, never on `main`, so it can't ride along into
+# branches cut for upstream PRs. To publish, merge `main` into `ci` and push:
+#
+#   git checkout ci && git merge main && git push
+#
+# Tags pushed on every run:
+#   :latest        the newest `ci` build (what docker-compose pulls by default)
+#   :sha-<short>   immutable pin of the `ci` commit that was built
+#
+# The upstream release workflow (oss-publish-images.yml) only runs in
+# omnigent-ai/omnigent and pushes to its registry, so a fork needs its own.
+name: Publish fork server image
+
+on:
+  push:
+    branches: [ci]
+
+permissions:
+  contents: read
+
+# Never cancel a push mid-build: a half-pushed manifest is worse than a queue.
+concurrency:
+  group: fork-publish-server-image
+  cancel-in-progress: false
+
+env:
+  # Add linux/arm64 (e.g. "linux/amd64,linux/arm64") for an ARM server; the
+  # arm64 half builds under QEMU and takes several times longer.
+  PLATFORMS: linux/amd64
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write # push to GHCR with GITHUB_TOKEN
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          # GHCR repository names must be lowercase.
+          owner=$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner}/omnigent-server"
+          sha=$(git rev-parse --short HEAD)
+          echo "tags=${image}:latest,${image}:sha-${sha}" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${image} (sha-${sha}) for ${PLATFORMS}"
+
+      - name: Set up QEMU
+        if: contains(env.PLATFORMS, 'arm64')
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          platforms: ${{ env.PLATFORMS }}
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
