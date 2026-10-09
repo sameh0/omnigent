@@ -94,7 +94,14 @@ import {
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
-import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRebasePath,
+  useSearchParams,
+} from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
@@ -202,6 +209,15 @@ import {
   readSessionFilter,
   writeSessionFilter,
 } from "@/lib/sessionFilterPreferences";
+import {
+  ALL_HOSTS,
+  matchesSessionHostFilter,
+  readSessionHostFilter,
+  sessionHostFilterOptions,
+  type SessionHostFilter,
+  type SessionHostFilterOption,
+  writeSessionHostFilter,
+} from "@/lib/sessionHostFilter";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { useViewerId } from "@/hooks/useViewerId";
@@ -232,6 +248,8 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { SIDEBAR_ROW } from "./sidebarStyles";
+import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
+import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 import { ALT_KEY, ARIA_MOD_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -433,11 +451,13 @@ function useActiveNavItem(): {
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const location = useLocation();
+  const rebasePath = useRebasePath();
   const extensions = useExtensions();
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
-  const isCanvasPage = !isExtensionRoute && leaf === "canvas";
+  const isCanvasPage =
+    !isExtensionRoute && isCanvasPathname(location.pathname, rebasePath("/canvas"));
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
@@ -613,6 +633,8 @@ function SidebarImpl({
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
+  const [searchParams] = useSearchParams();
+  const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -626,6 +648,8 @@ function SidebarImpl({
   // Active filter from the Sessions heading's menu, seeded from the persisted
   // preference so a reload keeps the slice the viewer was last on.
   const [activeTab, setActiveTab] = useState<SidebarTab>(() => readSessionFilter(multiUser));
+  // Machine filter from the same menu; narrows the Sessions list on top of the tab.
+  const [hostFilter, setHostFilter] = useState<SessionHostFilter>(readSessionHostFilter);
 
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
@@ -683,6 +707,16 @@ function SidebarImpl({
       if (selectionMode) exitSelectionMode();
       setActiveTab(tab);
       writeSessionFilter(tab);
+    },
+    [selectionMode, exitSelectionMode],
+  );
+
+  // Same selection cleanup as switchTab: the visible slice changes.
+  const switchHostFilter = useCallback(
+    (value: SessionHostFilter) => {
+      if (selectionMode) exitSelectionMode();
+      setHostFilter(value);
+      writeSessionHostFilter(value);
     },
     [selectionMode, exitSelectionMode],
   );
@@ -1186,7 +1220,7 @@ function SidebarImpl({
               </Button>
               {canvasEnabled && (
                 <PrimaryNavLink
-                  to="/canvas"
+                  to={canvasDestination.pathname + canvasDestination.search}
                   label="Canvas"
                   icon={LayoutDashboardIcon}
                   active={isCanvasPage}
@@ -1249,7 +1283,7 @@ function SidebarImpl({
                 // without a gutter the last row's always-visible kebab parks
                 // underneath it and can't be tapped.
                 className={cn(
-                  "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16 md:mr-1",
+                  "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16",
                   // Reserve the gutter so toggling the thumb never reflows the list.
                   "[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
                   isScrolling
@@ -1266,6 +1300,8 @@ function SidebarImpl({
                     newSessionProjectName={newSessionProjectName}
                     activeTab={availableTab}
                     onActiveTabChange={switchTab}
+                    hostFilter={hostFilter}
+                    onHostFilterChange={switchHostFilter}
                     multiUser={multiUser}
                     pinnedConversationIds={pinnedConversationIds}
                     pinnedConversations={pinnedConversations}
@@ -1578,6 +1614,8 @@ interface ConversationListProps {
   newSessionProjectName: string | null;
   activeTab: SidebarTab;
   onActiveTabChange: (tab: SidebarTab) => void;
+  hostFilter: SessionHostFilter;
+  onHostFilterChange: (value: SessionHostFilter) => void;
   /** Multi-user server; gates the "Shared" filter option. */
   multiUser: boolean;
   pinnedConversationIds: string[];
@@ -1606,6 +1644,8 @@ function ConversationList({
   newSessionProjectName,
   activeTab,
   onActiveTabChange,
+  hostFilter,
+  onHostFilterChange,
   multiUser,
   pinnedConversationIds,
   pinnedConversations,
@@ -1638,6 +1678,12 @@ function ConversationList({
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
   );
+  const hostFilterOptions = useMemo(
+    () => sessionHostFilterOptions(allConversations, hosts, hostFilter),
+    [allConversations, hosts, hostFilter],
+  );
+  // Scope key for pagination and auto-load: either filter changing starts over.
+  const listScopeKey = hostFilter === ALL_HOSTS ? activeTab : `${activeTab}|${hostFilter}`;
 
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
@@ -1759,6 +1805,12 @@ function ConversationList({
           : activeTab === "mine"
             ? notArchived.filter((c) => isOwnedByViewer(c, viewerId))
             : notArchived;
+    // The machine filter narrows only the flat Sessions list, like the tab:
+    // pins and project folders stay put.
+    const hostScoped =
+      hostFilter === ALL_HOSTS
+        ? tabScoped
+        : tabScoped.filter((c) => matchesSessionHostFilter(c, hostFilter, hostsById));
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
@@ -1811,7 +1863,7 @@ function ConversationList({
 
     // Sessions: the remainder — not pinned, not filed.
     const sessions = sortByUpdatedAtDesc(
-      tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
+      hostScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
       activeOverride,
       frozenKeys,
     );
@@ -1824,13 +1876,15 @@ function ConversationList({
     frozenKeys,
     projects,
     activeTab,
+    hostFilter,
+    hostsById,
     viewerId,
   ]);
 
   const config = useContext(SidebarConfigContext);
   const displayPagination = useSidebarDisplayPagination(
     loadedSections.sessions,
-    JSON.stringify([activeTab, searchQuery]),
+    JSON.stringify([listScopeKey, searchQuery]),
     activeTab === "shared"
       ? (config.sharedDisplayPageSize ?? config.displayPageSize)
       : config.displayPageSize,
@@ -2228,7 +2282,7 @@ function ConversationList({
   // so there's no client-side list to normalize against the loaded window —
   // the pinned query returns exactly the pinned sessions, unpinning removes the
   // label, and a deleted session drops out of the query on the server.
-  const autoLoadBudget = useRef<AutoLoadBudget>({ scope: activeTab, count: 0 });
+  const autoLoadBudget = useRef<AutoLoadBudget>({ scope: listScopeKey, count: 0 });
   const hasMorePages = displayPagination.hasMore;
   const fetchNextPage = displayPagination.loadMore;
   const { isFetchingNextPage } = conversationsQuery;
@@ -2347,7 +2401,7 @@ function ConversationList({
               user on a false "empty" state. */}
                   {hasMorePages && (
                     <InfiniteScrollSentinel
-                      scopeKey={activeTab}
+                      scopeKey={listScopeKey}
                       budgetRef={autoLoadBudget}
                       maxAutoLoads={displayPagination.maxAutoLoads}
                       hasMore={hasMorePages}
@@ -2506,7 +2560,13 @@ function ConversationList({
                         title="Sessions"
                         conversations={sections.sessions}
                         activeConversationId={displayedActiveId}
-                        emptyMessage={sessionStatus ? undefined : SIDEBAR_FILTER_EMPTY[activeTab]}
+                        emptyMessage={
+                          sessionStatus
+                            ? undefined
+                            : hostFilter === ALL_HOSTS
+                              ? SIDEBAR_FILTER_EMPTY[activeTab]
+                              : "No sessions on this machine"
+                        }
                         footer={sessionStatus}
                         pinnedConversationIds={pinnedConversationIds}
                         collapsed={effectiveCollapsedSections.includes("Chats")}
@@ -2586,6 +2646,9 @@ function ConversationList({
                             value={activeTab}
                             onChange={onActiveTabChange}
                             multiUser={multiUser}
+                            hostValue={hostFilter}
+                            hostOptions={hostFilterOptions}
+                            onHostChange={onHostFilterChange}
                           />
                         }
                       />
@@ -2601,7 +2664,7 @@ function ConversationList({
               under a collapsed group reads orphaned. */}
                   {!effectiveCollapsedSections.includes("Chats") && (
                     <InfiniteScrollSentinel
-                      scopeKey={activeTab}
+                      scopeKey={listScopeKey}
                       budgetRef={autoLoadBudget}
                       maxAutoLoads={displayPagination.maxAutoLoads}
                       hasMore={hasMorePages}
@@ -2935,20 +2998,34 @@ function SectionHeader({
   );
 }
 
-// Scope filter on the Sessions heading. A radio group: the options are
-// mutually exclusive slices of one list.
+// Scope filter on the Sessions heading: a "Display" radio group (mutually
+// exclusive slices of one list) and, when there is more than one machine to
+// pick, a "Machine" radio group applied on top of it.
 function SessionFilterMenu({
   value,
   onChange,
   multiUser,
+  hostValue,
+  hostOptions,
+  onHostChange,
 }: {
   value: SidebarTab;
   onChange: (value: SidebarTab) => void;
   multiUser: boolean;
+  hostValue: SessionHostFilter;
+  hostOptions: SessionHostFilterOption[];
+  onHostChange: (value: SessionHostFilter) => void;
 }) {
   const filters = multiUser
     ? SIDEBAR_FILTERS
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
+  const hostFiltered = hostValue !== ALL_HOSTS;
+  // A stale pick stays listed (see sessionHostFilterOptions), so it can be undone.
+  const showHosts = hostOptions.length > 1 || hostFiltered;
+  // The machine filter hides rows, so make it visible while it's on.
+  const tooltip = hostFiltered
+    ? `Filter sessions · ${hostOptions.find((option) => option.value === hostValue)?.label ?? ""}`
+    : "Filter sessions";
   return (
     <DropdownMenu>
       <Tooltip disableHoverableContent>
@@ -2960,18 +3037,25 @@ function SessionFilterMenu({
                 type="button"
                 variant="ghost"
                 size="icon-xs"
-                aria-label="Filter sessions"
+                aria-label={tooltip}
                 data-testid="session-filter"
-                className="text-muted-foreground"
+                data-active={String(hostFiltered)}
+                className={cn(
+                  "relative",
+                  hostFiltered ? "text-foreground" : "text-muted-foreground",
+                )}
                 onClick={(event) => event.stopPropagation()}
               >
                 <ListFilterIcon className="size-3.5" />
+                {hostFiltered && (
+                  <span className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-primary" />
+                )}
               </Button>
             </DropdownMenuTrigger>
           </span>
         </TooltipTrigger>
         <TooltipContent side="bottom" data-noninteractive-tooltip>
-          Filter sessions
+          {tooltip}
         </TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
@@ -2990,6 +3074,38 @@ function SessionFilterMenu({
             </DropdownMenuRadioItem>
           ))}
         </DropdownMenuRadioGroup>
+        {showHosts && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel className="text-muted-foreground text-sm">Machine</DropdownMenuLabel>
+            <DropdownMenuRadioGroup
+              value={hostValue}
+              onValueChange={(next) => onHostChange(next as SessionHostFilter)}
+            >
+              <DropdownMenuRadioItem value={ALL_HOSTS} data-testid="session-host-filter-all">
+                All machines
+              </DropdownMenuRadioItem>
+              {hostOptions.map((option) => (
+                <DropdownMenuRadioItem
+                  key={option.value}
+                  value={option.value}
+                  data-testid={`session-host-filter-${option.value}`}
+                >
+                  <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                  {option.status && (
+                    <span
+                      aria-label={option.status}
+                      className={cn(
+                        "ml-2 inline-block size-1.5 shrink-0 rounded-full",
+                        option.status === "online" ? "bg-green-500" : "bg-muted-foreground",
+                      )}
+                    />
+                  )}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

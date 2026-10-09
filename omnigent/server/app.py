@@ -18,6 +18,7 @@ from itertools import batched, groupby
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -120,7 +121,12 @@ from omnigent.server.routes.sessions import (
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
-from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
+from omnigent.server.runner_session_init import (
+    TRANSIENT_REJECTION_STATUSES,
+    RunnerSessionInitializer,
+    is_session_agent_removed,
+    runner_response_error_body,
+)
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -3551,10 +3557,12 @@ def create_app(
         never fires for it). Mirrors that callback's by-runner lookup,
         but carries the daemon-composed error onto the ``session.status:
         failed`` event so the open view surfaces the cause immediately
-        instead of spinning on "starting" until a timeout. An idle
-        top-level session is included for exactly that reason; an idle
-        sub-agent is not, since its work finished on a runner that was
-        already live.
+        instead of spinning on "starting" until a timeout. Only a runner
+        that never connected fails an idle top-level session for that
+        reason: when the host dies after the runner ran, an idle session
+        lost no work and stays idle (offline via liveness). An idle
+        sub-agent is not failed either way, since its work finished on a
+        runner that was already live.
 
         :param host_id: The reporting host's id.
         :param runner_id: The crashed runner's id.
@@ -3569,6 +3577,9 @@ def create_app(
         # cancel any pending disconnect-grace timer so it can't re-run the
         # disconnect reconciliation on top of it.
         _cancel_disconnect_grace(runner_id)
+        # A runner this replica saw connect already ran, so its idle sessions lost
+        # no work; a replica that never saw it has no stamp and keeps failing them.
+        runner_ran = session_live_state.last_liveness_stamp(runner_id) is not None
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -3585,13 +3596,11 @@ def create_app(
             affected,
             ErrorDetail(code="runner_failed_to_start", message=error),
             conversation_store,
-            fail_idle_top_level=True,
+            fail_idle_top_level=not runner_ran,
         )
 
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
         """Attach bound streams, then recover independent session trees concurrently."""
-        import httpx
-
         from omnigent.entities import Conversation
         from omnigent.server.child_session_recovery import (
             RECOVERY_STORE_CONCURRENCY,
@@ -3660,11 +3669,24 @@ def create_app(
                             routed = runner_router.client_for_session_resources(
                                 conv.id, conversation=conv
                             )
-                        except OmnigentError:
-                            _logger.exception(
-                                "Failed to resolve runner client for session %s on reconnect",
-                                conv.id,
-                            )
+                        except OmnigentError as exc:
+                            if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):
+                                # The runner dropped again before we reached this session.
+                                _logger.warning(
+                                    "Runner %s went offline before session %s was re-attached",
+                                    runner_id,
+                                    conv.id,
+                                    extra=debug_event(
+                                        "runner_reconnect_client_offline",
+                                        runner_id=runner_id,
+                                        error_code=exc.code,
+                                    ),
+                                )
+                            else:
+                                _logger.exception(
+                                    "Failed to resolve runner client for session %s on reconnect",
+                                    conv.id,
+                                )
                             continue
                         if routed.runner_id != runner_id:
                             continue
@@ -3730,13 +3752,44 @@ def create_app(
                             generation=connection.generation,
                             store_slots=store_slots,
                         )
-                except Exception:
-                    if tunnel_registry.get(runner_id) is connection:
-                        _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
-                    else:
+                except Exception as exc:
+                    if tunnel_registry.get(runner_id) is not connection:
                         _logger.info(
                             "Stopped recovering session %s: runner tunnel changed", conv.id
                         )
+                    elif isinstance(exc, (ConnectionError, httpx.TransportError)):
+                        # Tunnel dropped mid-request; the next reconnect retries.
+                        _logger.warning(
+                            "Lost runner tunnel re-assigning session %s on reconnect (%s: %s)",
+                            conv.id,
+                            type(exc).__name__,
+                            exc,
+                            extra=debug_event(
+                                "runner_reconnect_reassign_lost_tunnel",
+                                exc_type=type(exc).__name__,
+                            ),
+                        )
+                    elif isinstance(exc, httpx.HTTPStatusError):
+                        body = runner_response_error_body(exc.response)
+                        status = exc.response.status_code
+                        log = (
+                            _logger.warning
+                            if status in TRANSIENT_REJECTION_STATUSES
+                            else _logger.error
+                        )
+                        log(
+                            "Failed to re-assign session %s on reconnect: HTTP %d: %s",
+                            conv.id,
+                            status,
+                            body,
+                            extra=debug_event(
+                                "runner_reconnect_reassign_rejected",
+                                status_code=status,
+                                response_body=body,
+                            ),
+                        )
+                    else:
+                        _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
 
         # A hung initialization delays only its own tree. All tasks are joined and
         # cancelled with this connection; no detached recovery or shared deadline.
