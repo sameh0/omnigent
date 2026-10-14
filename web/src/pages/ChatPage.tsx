@@ -126,7 +126,12 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
-import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  getSessionDraft,
+  promoteSessionDraft,
+  setSessionDraft,
+  subscribeSessionDraftReplaced,
+} from "@/lib/sessionDrafts";
 import {
   restoreReplyDraft,
   serializeReplyDraft,
@@ -2610,6 +2615,21 @@ function ComposerImpl(
         replyDraft: replyDraftRef.current,
       });
     };
+  }, [conversationId, replaceText]);
+
+  // A draft replaced from outside (a revert handing its prompt back) wins over
+  // whatever this composer holds, and is clean — not "typed" — so unmounting
+  // during the reload can't write the old text over it.
+  useEffect(() => {
+    if (!conversationId) return;
+    return subscribeSessionDraftReplaced((replacedId) => {
+      if (replacedId !== conversationId) return;
+      const replaced = getSessionDraft(replacedId);
+      replaceText(replaced?.text ?? "", replaced?.replyDraft);
+      attachmentsRef.current.restoreFiles(replaced?.files ?? []);
+      dirtyRef.current = false;
+      if (!isMobileRef.current) textareaRef.current?.focus();
+    });
   }, [conversationId, replaceText]);
 
   // Publish edits as they happen so the open sidebar updates immediately,

@@ -73,6 +73,29 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
   notifyListeners();
 }
 
+const replacedListeners = new Set<(conversationId: string) => void>();
+
+/**
+ * Replace a session's draft from outside its composer — e.g. the prompt a
+ * revert hands back for editing. A mounted composer for that session adopts
+ * it at once instead of overwriting it with its own text on unmount.
+ */
+export function replaceSessionDraft(
+  conversationId: string,
+  text: string,
+  files: File[] = [],
+): void {
+  setSessionDraft(conversationId, { text, files });
+  for (const listener of replacedListeners) listener(conversationId);
+}
+
+export function subscribeSessionDraftReplaced(
+  listener: (conversationId: string) => void,
+): () => void {
+  replacedListeners.add(listener);
+  return () => replacedListeners.delete(listener);
+}
+
 /** Remove a draft and ignore any late cleanup write for the retired id. */
 export function retireSessionDraft(conversationId: string): SessionDraft | undefined {
   const draft = sessionDrafts.get(conversationId);

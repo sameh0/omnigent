@@ -1240,6 +1240,76 @@ shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
 
+### List Revert Points
+
+```
+GET /v1/sessions/{source_id}/revert-points
+
+200 OK
+{
+  "data": [
+    {
+      "id": "msg_abc123",
+      "text": "Original prompt text",
+      "has_attachments": false,
+      "created_at": 1700000000
+    }
+  ]
+}
+```
+
+Lists the user messages the session can be reverted to, newest first.
+Runtime notices (`[System: …]` markers, interrupts, task notifications)
+and meta messages are never revert points. Requires owner access.
+
+### Revert Session
+
+```
+POST /v1/sessions/{source_id}/revert
+Content-Type: application/json
+
+{
+  "user_message_id": "msg_abc123"
+}
+
+200 OK
+{
+  "draft": "Original prompt text",
+  "attachments": [
+    {"type": "input_image", "file_id": "file_abc123", "filename": "shot.png"}
+  ]
+}
+```
+
+Deletes the selected user message and every later conversation item
+while preserving the session ID, metadata, agent binding, and earlier
+history. Requires owner access, like deleting the session. The selected
+prompt and its attachments are returned for editing; attachment content
+stays readable at `/v1/sessions/{id}/resources/files/{file_id}/content`.
+
+After the rewind, any connected runtime drops its copy of the discarded
+history: a native terminal restarts, and an SDK runtime clears its
+cached transcript while keeping the session's terminals open. Connected
+clients receive a `session.reverted` event and reload the session.
+
+Native agents that can't replay earlier history into a fresh session can
+only be reverted to their first message.
+
+Workspace files, Git state, and files outside the workspace are never
+read or modified by this endpoint.
+
+```
+400 Bad Request — the target is not a revert point, the session is a
+  sub-agent, has no agent binding, or its native agent can't replay
+  the kept history
+403 Forbidden — the caller doesn't own the session
+404 Not Found — no session or bound agent exists
+409 Conflict — the session has an active turn, or gained items while
+  the revert was in progress
+503 Service Unavailable — the session's live runtime could not be
+  reached or reset
+```
+
 ### Stream Session
 
 ```
