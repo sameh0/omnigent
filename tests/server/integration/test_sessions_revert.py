@@ -101,3 +101,39 @@ async def test_revert_resets_a_live_native_runtime_before_rewinding(
     )
     snapshot = (await client.get(f"/v1/sessions/{source['id']}")).json()
     assert snapshot["labels"]["omnigent.fork.carry_history"] == "1"
+
+
+async def test_revert_resets_a_live_sdk_runtime_too(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An SDK runner caches the transcript in memory, so it must be reset as
+    well, or the next turn would still send the discarded messages."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    source = await _create_session(client, agent["id"], initial_message="retry sdk prompt")
+    target = _first_user_message(await _wait_for_idle(client, source["id"]))
+    runner_client = AsyncMock()
+    runner_client.post.return_value = httpx.Response(
+        200,
+        json={"reset": True},
+        request=httpx.Request("POST", "http://runner/reset-state"),
+    )
+    monkeypatch.setattr(sessions_module, "_agent_is_native", lambda _agent: False)
+    monkeypatch.setattr(
+        sessions_module,
+        "_get_runner_client",
+        AsyncMock(return_value=runner_client),
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{source['id']}/revert",
+        json={"user_message_id": target["id"]},
+    )
+
+    assert response.status_code == 200, response.text
+    runner_client.post.assert_awaited_once_with(
+        f"/v1/sessions/{source['id']}/reset-state",
+        timeout=15.0,
+    )

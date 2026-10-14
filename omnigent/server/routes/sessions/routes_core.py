@@ -126,7 +126,6 @@ from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history,
-    _agent_is_native,
     _announce_session_added,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
@@ -3920,10 +3919,12 @@ def register_core_routes(
     ) -> SessionRevertResponse:
         """Rewind one session to immediately before a selected user message."""
         user_id = _get_user_id(request, auth_provider)
+        # Owner only, like delete/archive: this permanently removes history,
+        # including other participants' messages in a shared session.
         access = await _require_access_and_level(
             user_id,
             source_id,
-            LEVEL_EDIT,
+            LEVEL_OWNER,
             permission_store,
             conversation_store,
         )
@@ -3976,8 +3977,10 @@ def register_core_routes(
             _agent_carries_native_fork_history,
             agent,
         )
-        is_native = await asyncio.to_thread(_agent_is_native, agent)
-        runner_client = await _get_runner_client(source_id, runner_router) if is_native else None
+        # Every live runner caches this session's state — a native terminal, or
+        # an SDK harness's in-memory transcript — so reset it before rewinding,
+        # or the next turn would still carry the discarded messages.
+        runner_client = await _get_runner_client(source_id, runner_router)
         if runner_client is not None:
             try:
                 reset_response = await runner_client.post(

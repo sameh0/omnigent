@@ -770,12 +770,12 @@ export function AppShell() {
     (isKnownTopLevel || isChildSession) &&
     (permissionLevel === null || permissionLevel >= 1);
   const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
-  // Reverting rewrites this session's own history, so it needs edit access
-  // and a top-level session (the server rejects sub-agents).
+  // Reverting permanently deletes history, so it's owner-only like delete and
+  // archive, and top-level only (the server rejects sub-agents).
   const canRevert =
     !!serverConversationId &&
     isKnownTopLevel &&
-    (permissionLevel === null || isEditorLevel(permissionLevel));
+    (permissionLevel === null || isOwnerLevel(permissionLevel));
   const [revertOpen, setRevertOpen] = useState(false);
   const [revertUserMessageId, setRevertUserMessageId] = useState<string | null>(null);
   // Agent tools/policies exist to show.

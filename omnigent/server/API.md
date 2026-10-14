@@ -1258,8 +1258,10 @@ Content-Type: application/json
 
 Deletes the selected user message and every later conversation item
 while preserving the session ID, metadata, agent binding, and earlier
-history. Native runtime state is reset so discarded native history
-cannot reappear, and the selected prompt is returned for editing.
+history. Requires owner access, like deleting the session. Any connected
+runtime (a native terminal, or an SDK harness's cached transcript) is reset
+first so the discarded history cannot reappear, and the selected prompt is
+returned for editing.
 
 Workspace files, Git state, and files outside the workspace are never
 read or modified by this endpoint.
@@ -1267,9 +1269,10 @@ read or modified by this endpoint.
 ```
 400 Bad Request — the target is not a selectable user message, the
   session is a sub-agent, or the session has no agent binding
+403 Forbidden — the caller doesn't own the session
 404 Not Found — no session or bound agent exists
 409 Conflict — the session has an active or waiting turn
-503 Service Unavailable — a connected native runtime could not reset
+503 Service Unavailable — a connected runtime could not reset
 ```
 
 ### Stream Session
