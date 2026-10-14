@@ -888,6 +888,19 @@ export async function forkSession(
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+/** Rewind a session to immediately before a selected user message. */
+export async function revertSession(
+  sourceId: string,
+  userMessageId: string,
+): Promise<{ draft: string }> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/revert`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    body: JSON.stringify({ user_message_id: userMessageId }),
+  });
+  return readJsonOrThrow<{ draft: string }>(res);
+}
+
 /**
  * Fork a generic side chat in the parent's current working directory.
  * Reuse the parent's live runner, relaunching the parent first if it has

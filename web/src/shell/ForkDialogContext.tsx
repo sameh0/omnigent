@@ -29,6 +29,10 @@ export interface ForkDialogContextValue {
     upToResponseId?: string;
     workspaceRecovery?: boolean;
   }) => void;
+  /** Whether the viewer may rewind the current top-level session in place. */
+  canRevert?: boolean;
+  /** Open the revert picker, optionally preselecting a user message. */
+  openRevertDialog?: (opts?: { userMessageId?: string }) => void;
 }
 
 const ForkDialogContext = createContext<ForkDialogContextValue | null>(null);

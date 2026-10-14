@@ -21,6 +21,7 @@ import {
   ImageIcon,
   Link2Icon,
   Loader2Icon,
+  PencilIcon,
   SplitIcon,
   XIcon,
 } from "lucide-react";
@@ -711,6 +712,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
   const sessionId = useScopedConversationId();
+  const forkDialog = useForkDialog();
+  // Revert rewrites the shell's current session only, never a side chat's.
+  const canEditFromHere =
+    forkDialog?.canRevert === true &&
+    forkDialog.openRevertDialog !== undefined &&
+    sessionId === forkDialog.currentSessionId &&
+    !bubble.pending;
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
@@ -927,6 +935,18 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 componentId="chat.message.copy_user"
               >
                 {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+              </MessageAction>
+            )}
+            {canEditFromHere && (
+              <MessageAction
+                tooltip="Edit from here"
+                label="Edit from here"
+                size="icon-xxs"
+                data-testid="revert-from-message"
+                onClick={() => forkDialog.openRevertDialog?.({ userMessageId: bubble.itemId })}
+                componentId="chat.message.revert"
+              >
+                <PencilIcon size={14} />
               </MessageAction>
             )}
             <MessageAction

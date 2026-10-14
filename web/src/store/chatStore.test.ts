@@ -1104,6 +1104,32 @@ describe("chatStore — lazy subtree usage", () => {
 });
 
 describe("chatStore — switchTo", () => {
+  it("reload rebuilds a rewound transcript for the same session", async () => {
+    const original = [
+      userMessage("resp_1", "keep"),
+      assistantMessage("resp_1", "kept response"),
+      userMessage("resp_2", "discard"),
+    ];
+    seedSession("conv_rewind", original);
+    await useChatStore.getState().switchTo("conv_rewind");
+    expect(useChatStore.getState().blocks).toHaveLength(3);
+
+    // The server dropped the last prompt; a warm entry can't learn that from
+    // its stream, so only a reload shows the shorter history.
+    seedSession("conv_rewind", original.slice(0, 2));
+    await useChatStore.getState().switchTo("conv_rewind");
+    expect(useChatStore.getState().blocks).toHaveLength(3);
+
+    await useChatStore.getState().switchTo("conv_rewind", { reload: true });
+
+    const state = useChatStore.getState();
+    expect(state.conversationId).toBe("conv_rewind");
+    expect(state.blocks.map((block) => block.ctx.itemId)).toEqual(
+      original.slice(0, 2).map((item) => item.id),
+    );
+    expect(state.loadingConversation).toBe(false);
+  });
+
   it("hydrates blocks from the session snapshot when switching to a real conv id", async () => {
     const items: ConversationItem[] = [
       userMessage("resp_1", "hello"),

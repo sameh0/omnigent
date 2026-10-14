@@ -1218,7 +1218,12 @@ export interface ChatActions {
     opts?: SendOptions,
   ) => Promise<void>;
   stop: () => void;
-  switchTo: (conversationId: string | null) => Promise<void>;
+  /**
+   * Make `conversationId` the active conversation. `reload` drops its live
+   * entry first so the transcript is rebuilt from the server — needed after a
+   * server-side rewrite (e.g. a revert) that a warm stream can't express.
+   */
+  switchTo: (conversationId: string | null, opts?: { reload?: boolean }) => Promise<void>;
   submitApproval: (
     elicitationId: string,
     action: "accept" | "decline" | "cancel",
@@ -2859,8 +2864,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  switchTo: async (conversationId) => {
-    if (get().conversationId === conversationId) return;
+  switchTo: async (conversationId, opts) => {
+    const reload = opts?.reload === true && conversationId !== null;
+    if (!reload && get().conversationId === conversationId) return;
+    // A reload discards the retained transcript and its stream, so everything
+    // below takes the cold-bind path and re-fetches the server's history.
+    if (reload) conversationRegistry.release(conversationId);
 
     // Whether this conversation is already live AND current decides everything
     // below, so read it before anything can create the entry. A retained entry

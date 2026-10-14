@@ -638,6 +638,8 @@ async def test_reset_state_closes_terminals_and_publishes_deleted(tmp_path: Path
     dead terminal, and attaching to it failed with "terminal resource
     not found or not running".
     """
+    from omnigent.runner.app import _session_histories_ref
+
     conv_id = "conv_switch_term_teardown"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -647,6 +649,7 @@ async def test_reset_state_closes_terminals_and_publishes_deleted(tmp_path: Path
     # Private-attr seed matches the existing resource-registry test
     # convention (no real tmux).
     _seed_registry(terminal_registry, conv_id, [_make_instance("tui", "main", tmp_path)])
+    _session_histories_ref[conv_id] = [{"type": "message", "role": "user", "content": []}]
     registry = SessionResourceRegistry(
         terminal_registry=terminal_registry,
         runner_workspace=workspace,
@@ -691,6 +694,7 @@ async def test_reset_state_closes_terminals_and_publishes_deleted(tmp_path: Path
         "reset-state must close the session's terminals; this one is "
         "still registered, so the web UI would keep listing it."
     )
+    assert conv_id not in _session_histories_ref
 
     # Exactly one session.resource.deleted for the closed terminal so
     # connected clients drop it live (the server relay also persists it).

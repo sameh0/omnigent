@@ -2690,6 +2690,20 @@ class SessionForkRequest(BaseModel):
         return self
 
 
+class SessionRevertRequest(BaseModel):
+    """Request to rewind a session to before a past user message."""
+
+    user_message_id: str = Field(min_length=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionRevertResponse(BaseModel):
+    """Selected prompt returned to the client as an editable draft."""
+
+    draft: str
+
+
 class ReadStatePutRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{session_id}/read-state``.
