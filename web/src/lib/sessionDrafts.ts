@@ -80,8 +80,12 @@ const replacedListeners = new Set<(conversationId: string) => void>();
  * revert hands back for editing. A mounted composer for that session adopts
  * it at once instead of overwriting it with its own text on unmount.
  */
-export function replaceSessionDraft(conversationId: string, text: string): void {
-  setSessionDraft(conversationId, { text, files: [] });
+export function replaceSessionDraft(
+  conversationId: string,
+  text: string,
+  files: File[] = [],
+): void {
+  setSessionDraft(conversationId, { text, files });
   for (const listener of replacedListeners) listener(conversationId);
 }
 

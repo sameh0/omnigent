@@ -713,12 +713,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // the main conversation the root store projects.
   const sessionId = useScopedConversationId();
   const forkDialog = useForkDialog();
-  // Revert rewrites the shell's current session only, never a side chat's.
+  // Revert rewrites the shell's current session only, never a side chat's,
+  // and needs a stored prompt: not a queued, placeholder-id or shell bubble.
   const canEditFromHere =
     forkDialog?.canRevert === true &&
     forkDialog.openRevertDialog !== undefined &&
     sessionId === forkDialog.currentSessionId &&
-    !bubble.pending;
+    !bubble.pending &&
+    !bubble.syntheticItemId &&
+    bubble.shellCommand === undefined;
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an

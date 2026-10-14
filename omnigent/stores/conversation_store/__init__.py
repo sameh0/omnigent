@@ -339,6 +339,10 @@ class ConversationAlreadyExistsError(Exception):
     """Raised when a caller-supplied conversation id is already in use."""
 
 
+class ConversationChangedError(Exception):
+    """Raised when a conversation gained items after the caller last checked it."""
+
+
 class NameAlreadyExistsError(Exception):
     """
     Raised by ``create_conversation`` when the requested
@@ -1840,6 +1844,7 @@ class ConversationStore(ABC):
         conversation_id: str,
         *,
         before_item_id: str,
+        expected_last_item_id: str | None = None,
         carry_history_into_native: bool = False,
     ) -> Conversation:
         """Delete a selected item and everything after it in the same session.
@@ -1849,10 +1854,14 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session to rewind, e.g. ``"conv_abc123"``.
         :param before_item_id: First item to delete, e.g. ``"msg_def456"``.
+        :param expected_last_item_id: The newest item the caller saw. When set,
+            the rewind refuses to run if a later item was appended since.
         :param carry_history_into_native: Whether to mark the retained items for
             native transcript replay.
         :returns: The updated conversation with the same id.
         :raises LookupError: If the conversation or cutoff item does not exist.
+        :raises ConversationChangedError: If ``expected_last_item_id`` is no
+            longer the newest item.
         """
         ...
 

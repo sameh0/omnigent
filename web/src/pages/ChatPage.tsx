@@ -2626,7 +2626,7 @@ function ComposerImpl(
       if (replacedId !== conversationId) return;
       const replaced = getSessionDraft(replacedId);
       replaceText(replaced?.text ?? "", replaced?.replyDraft);
-      attachmentsRef.current.restoreFiles([]);
+      attachmentsRef.current.restoreFiles(replaced?.files ?? []);
       dirtyRef.current = false;
       if (!isMobileRef.current) textareaRef.current?.focus();
     });

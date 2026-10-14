@@ -37,7 +37,6 @@ from omnigent.entities import (
     Agent,
     CommentsFingerprint,
     Conversation,
-    ConversationItem,
     MessageData,
     StoredFile,
     synthesize_conversation_title,
@@ -52,6 +51,7 @@ from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
+    session_stream,
     user_session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
@@ -126,6 +126,7 @@ from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history,
+    _agent_is_native,
     _announce_session_added,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
@@ -139,7 +140,6 @@ from omnigent.server.routes._sessions.helpers import (
     _grant_default_public,
     _live_settings_change,
     _LiveSettingsChange,
-    _message_text,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
     _note_settings_write,
@@ -208,10 +208,14 @@ from omnigent.server.schemas import (
     SessionListItem,
     SessionProjectSummary,
     SessionResponse,
+    SessionRevertedEvent,
+    SessionRevertPoint,
+    SessionRevertPointsResponse,
     SessionRevertRequest,
     SessionRevertResponse,
     UpdateSessionRequest,
 )
+from omnigent.server.session_revert import revert_attachments, revert_point
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -224,6 +228,7 @@ from omnigent.stores.conversation_store import (
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    ConversationChangedError,
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -389,24 +394,75 @@ def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
     return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
 
 
-def _list_all_items_for_revert(
+def _list_revert_points(
     conversation_store: ConversationStore,
     session_id: str,
-) -> list[ConversationItem]:
-    """Read a complete transcript through the store's cursor contract."""
-    items: list[ConversationItem] = []
+) -> list[SessionRevertPoint]:
+    """Return a session's revert points, newest first."""
+    points: list[SessionRevertPoint] = []
     after: str | None = None
     while True:
         page = conversation_store.list_items(
             session_id,
             limit=1000,
             after=after,
-            order="asc",
+            order="desc",
+            type="message",
         )
-        items.extend(page.data)
+        points.extend(point for item in page.data if (point := revert_point(item)) is not None)
         if not page.has_more or not page.data:
-            return items
+            return points
         after = page.data[-1].id
+
+
+def _revert_busy_error() -> OmnigentError:
+    return OmnigentError(
+        "Wait for the current turn to finish before reverting.",
+        code=ErrorCode.CONFLICT,
+    )
+
+
+def _revert_runtime_unavailable_error() -> OmnigentError:
+    return OmnigentError(
+        "The session's runtime could not be reached. Please retry.",
+        code=ErrorCode.RUNNER_UNAVAILABLE,
+    )
+
+
+async def _reset_runtime_after_revert(
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    native: bool,
+) -> None:
+    """Drop the runtime's copy of the discarded history.
+
+    Native sessions restart their terminal; SDK sessions only drop the cached
+    transcript and harness process, keeping the user's terminals open.
+    """
+    quoted = urllib.parse.quote(session_id, safe="")
+    try:
+        if not native:
+            response = await runner_client.post(
+                f"/v1/sessions/{quoted}/history/reset", timeout=15.0
+            )
+            # Runners predating the targeted endpoint fall back to a full reset.
+            if response.status_code != 404:
+                response.raise_for_status()
+                return
+        response = await runner_client.post(f"/v1/sessions/{quoted}/reset-state", timeout=15.0)
+        response.raise_for_status()
+    except (httpx.HTTPError, ConnectionError) as exc:
+        _logger.warning(
+            "Runtime reset failed after revert",
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        raise OmnigentError(
+            "The conversation was reverted, but its runtime could not be reset. "
+            "Stop the session before sending another message.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
 
 
 def register_core_routes(
@@ -3905,6 +3961,29 @@ def register_core_routes(
             agent_name=base_agent.name,
         )
 
+    # ── GET /sessions/{source_id}/revert-points ──────────────────
+
+    @router.get(
+        "/sessions/{source_id}/revert-points",
+        response_model=None,
+        responses={200: {"model": SessionRevertPointsResponse}},
+    )
+    async def list_revert_points(
+        request: Request,
+        source_id: str,
+    ) -> SessionRevertPointsResponse:
+        """List the user messages this session can be reverted to, newest first."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id,
+            source_id,
+            LEVEL_OWNER,
+            permission_store,
+            conversation_store,
+        )
+        points = await asyncio.to_thread(_list_revert_points, conversation_store, source_id)
+        return SessionRevertPointsResponse(data=points)
+
     # ── POST /sessions/{source_id}/revert ────────────────────────
 
     @router.post(
@@ -3938,30 +4017,24 @@ def register_core_routes(
                 "Only top-level sessions can be reverted.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if _session_status_from_cache(source_id) in ("running", "waiting"):
-            raise OmnigentError(
-                "Wait for the current turn to finish before reverting.",
-                code=ErrorCode.CONFLICT,
-            )
-
-        items = await asyncio.to_thread(
-            _list_all_items_for_revert,
-            conversation_store,
-            source_id,
+        # Snapshot the newest item before checking status: the rewind refuses
+        # to run if anything is appended after this point.
+        newest = await asyncio.to_thread(
+            conversation_store.list_items, source_id, limit=1, order="desc"
         )
-        target = next((item for item in items if item.id == body.user_message_id), None)
-        if target is None:
-            raise OmnigentError(
-                f"User message not found: {body.user_message_id!r}",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if (
-            target.type != "message"
-            or not isinstance(target.data, MessageData)
-            or target.data.role != "user"
-            or target.data.is_meta
-            or (_message_text(target.data.content) or "").lstrip().startswith("[System:")
-        ):
+        expected_last_item_id = newest.data[0].id if newest.data else None
+        # Re-read after the snapshot; the DB status covers a turn running on
+        # another replica's tunnel.
+        current = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+        live_status = current.live_status if current is not None else None
+        if _session_status_from_cache(source_id, live_status) == "running":
+            raise _revert_busy_error()
+
+        target = await asyncio.to_thread(
+            conversation_store.get_item, source_id, body.user_message_id
+        )
+        point = revert_point(target) if target is not None else None
+        if target is None or point is None or not isinstance(target.data, MessageData):
             raise OmnigentError(
                 "The revert point must be a user message.",
                 code=ErrorCode.INVALID_INPUT,
@@ -3972,40 +4045,72 @@ def register_core_routes(
         if agent is None:
             raise OmnigentError("Session agent not found.", code=ErrorCode.NOT_FOUND)
 
+        is_native = await asyncio.to_thread(_agent_is_native, agent)
         target_is_cursor = await asyncio.to_thread(_agent_carries_cursor_fork_history, agent)
         carry_history_into_native = target_is_cursor or await asyncio.to_thread(
             _agent_carries_native_fork_history,
             agent,
         )
-        # Every live runner caches this session's state — a native terminal, or
-        # an SDK harness's in-memory transcript — so reset it before rewinding,
-        # or the next turn would still carry the discarded messages.
-        runner_client = await _get_runner_client(source_id, runner_router)
-        if runner_client is not None:
-            try:
-                reset_response = await runner_client.post(
-                    f"/v1/sessions/{urllib.parse.quote(source_id, safe='')}/reset-state",
-                    timeout=15.0,
-                )
-                reset_response.raise_for_status()
-            except (httpx.HTTPError, ConnectionError) as exc:
+        if is_native and not carry_history_into_native:
+            # The native CLI relaunches fresh, so the kept turns would vanish
+            # from the agent's memory while the transcript still shows them.
+            kept = await asyncio.to_thread(
+                conversation_store.list_items, source_id, limit=1, before=target.id
+            )
+            if kept.data:
                 raise OmnigentError(
-                    "The native session could not be reset. Please retry.",
-                    code=ErrorCode.RUNNER_UNAVAILABLE,
-                ) from exc
+                    "This agent can't replay earlier history, so it can only be "
+                    "reverted to its first message. Fork the session instead.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
 
-        draft = _message_text(target.data.content) or ""
+        # A live runner caches this session's history (a native terminal, or
+        # an SDK harness's transcript). Find it before changing anything, so a
+        # runner we can't reach fails the revert instead of keeping old turns.
+        runner_client = await _get_runner_client(source_id, runner_router)
+        if runner_client is None:
+            connectivity = await asyncio.to_thread(
+                conversation_store.get_session_connectivity, [source_id]
+            )
+            conn = connectivity.get(source_id)
+            if (
+                conn is not None
+                and conn.runner_id is not None
+                and runner_seen_is_fresh(conn.runner_last_seen)
+            ):
+                raise _revert_runtime_unavailable_error()
+
+        # Rewind first: clearing the native session id before the runtime
+        # resets means a relaunch can't resume the discarded transcript.
         try:
             await asyncio.to_thread(
                 conversation_store.rewind_conversation,
                 source_id,
                 before_item_id=target.id,
+                expected_last_item_id=expected_last_item_id,
                 carry_history_into_native=carry_history_into_native,
             )
+        except ConversationChangedError as exc:
+            raise _revert_busy_error() from exc
         except LookupError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
-        return SessionRevertResponse(draft=draft)
+        # Published before the reset so viewers reload even if the reset fails.
+        session_stream.publish(
+            source_id,
+            SessionRevertedEvent(
+                type="session.reverted",
+                conversation_id=source_id,
+                user_message_id=target.id,
+            ).model_dump(),
+        )
+        if runner_client is not None:
+            await _reset_runtime_after_revert(runner_client, source_id, native=is_native)
+
+        return SessionRevertResponse(
+            draft=point.text,
+            attachments=revert_attachments(target.data.content),
+        )
 
     # ── POST /sessions/{session_id}/switch-agent (reserved) ──────
     # Placeholder: in-place agent switching was retired and will return with a

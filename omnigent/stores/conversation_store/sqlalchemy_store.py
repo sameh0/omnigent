@@ -65,6 +65,7 @@ from omnigent.db.utils import (
     _supports_fts5,
     build_search_snippet,
     delete_fts_by_conversation_ids,
+    delete_fts_by_item_ids,
     ensure_fts_table,
     extract_search_text,
     generate_conversation_id,
@@ -102,6 +103,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationAlreadyExistsError,
+    ConversationChangedError,
     ConversationNotFoundError,
     ConversationStore,
     ConversationUpdateResult,
@@ -4453,21 +4455,47 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str,
         *,
         before_item_id: str,
+        expected_last_item_id: str | None = None,
         carry_history_into_native: bool = False,
     ) -> Conversation:
         """Delete a selected item and all later items from one conversation."""
         now = now_epoch()
-        with self._conv_session("rewind_conversation") as session:
-            conversation = session.get(
-                SqlConversation,
-                (current_workspace_id(), conversation_id),
+        workspace_id = current_workspace_id()
+
+        # The native session id lives in the Omnigent DB, which may be a
+        # different database, so clear it first and restore it if the rewind
+        # fails: a stale id would resume the discarded native transcript.
+        def clear_external_session_id(session: Session) -> str | None:
+            meta_query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == workspace_id,
+                SqlConversationMetadata.id == conversation_id,
             )
+            if self._meta_supports_for_update:
+                meta_query = meta_query.with_for_update()
+            metadata = session.execute(meta_query).scalar_one_or_none()
+            if metadata is None:
+                return None
+            previous = metadata.external_session_id
+            metadata.external_session_id = None
+            return previous
+
+        def rewind(session: Session) -> None:
+            conv_query = select(SqlConversation).where(
+                SqlConversation.workspace_id == workspace_id,
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                conv_query = conv_query.with_for_update()
+            conversation = session.execute(conv_query).scalar_one_or_none()
             if conversation is None:
                 raise LookupError(f"conversation not found: {conversation_id!r}")
+            in_conversation = (
+                SqlConversationItem.workspace_id == workspace_id,
+                SqlConversationItem.conversation_id == conversation_id,
+            )
             target_position = session.execute(
                 select(SqlConversationItem.position).where(
-                    SqlConversationItem.workspace_id == current_workspace_id(),
-                    SqlConversationItem.conversation_id == conversation_id,
+                    *in_conversation,
                     SqlConversationItem.id == before_item_id,
                 )
             ).scalar_one_or_none()
@@ -4475,33 +4503,34 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise LookupError(
                     f"item not found in conversation {conversation_id!r}: {before_item_id!r}"
                 )
+            if expected_last_item_id is not None:
+                last_item_id = session.execute(
+                    select(SqlConversationItem.id)
+                    .where(*in_conversation)
+                    .order_by(SqlConversationItem.position.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if last_item_id != expected_last_item_id:
+                    raise ConversationChangedError(
+                        f"conversation {conversation_id!r} changed during the rewind"
+                    )
 
             # ponytail: child sessions lack an origin item id; add that link before
             # cascading post-rewind children instead of guessing from timestamps.
-            kept_items = (
+            removed_ids = list(
                 session.execute(
-                    select(SqlConversationItem)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.conversation_id == conversation_id,
-                        SqlConversationItem.position < target_position,
+                    select(SqlConversationItem.id).where(
+                        *in_conversation,
+                        SqlConversationItem.position >= target_position,
                     )
-                    .order_by(SqlConversationItem.position.asc())
-                )
-                .scalars()
-                .all()
+                ).scalars()
             )
-            delete_fts_by_conversation_ids(session, [conversation_id])
+            delete_fts_by_item_ids(session, removed_ids)
             session.execute(
                 delete(SqlConversationItem).where(
-                    SqlConversationItem.workspace_id == current_workspace_id(),
-                    SqlConversationItem.conversation_id == conversation_id,
+                    *in_conversation,
                     SqlConversationItem.position >= target_position,
                 )
-            )
-            insert_fts_bulk(
-                session,
-                [(item.id, conversation_id, item.search_text or "") for item in kept_items],
             )
 
             conversation.next_position = target_position
@@ -4512,7 +4541,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             }
             session.execute(
                 delete(SqlConversationLabel).where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.workspace_id == workspace_id,
                     SqlConversationLabel.conversation_id == conversation_id,
                     SqlConversationLabel.key.in_(reset_label_keys),
                 )
@@ -4525,13 +4554,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                     now,
                 )
 
-        with self._session("clear_rewound_external_session_id") as session:
-            metadata = session.get(
-                SqlConversationMetadata,
-                (current_workspace_id(), conversation_id),
-            )
-            if metadata is not None:
-                metadata.external_session_id = None
+        previous_external_id = run_write_transaction(
+            self._session_immediate,
+            "clear_rewound_external_session_id",
+            clear_external_session_id,
+        )
+        try:
+            run_write_transaction(self._conv_session_immediate, "rewind_conversation", rewind)
+        except Exception:
+            if previous_external_id is not None:
+                try:
+                    self.set_external_session_id(conversation_id, previous_external_id)
+                except Exception:  # noqa: BLE001 — keep the rewind's own error
+                    _logger.warning(
+                        "Could not restore external_session_id after a failed rewind",
+                        exc_info=True,
+                        extra={"session_id": conversation_id},
+                    )
+            raise
 
         updated = self.get_conversation(conversation_id)
         if updated is None:

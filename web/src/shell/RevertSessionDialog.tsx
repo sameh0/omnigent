@@ -11,42 +11,33 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { isMessageItem, type MessageItem } from "@/lib/conversationItems";
-import { fetchSessionItemsPage, revertSession } from "@/lib/sessionsApi";
+import {
+  fetchRevertPoints,
+  fetchSessionFile,
+  revertSession,
+  type RevertAttachment,
+} from "@/lib/sessionsApi";
 import { replaceSessionDraft } from "@/lib/sessionDrafts";
-import { isSystemUserContent } from "@/lib/systemMessage";
+import { consumeLocalRevert, noteLocalRevert } from "@/lib/sessionRevert";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
 
-function messageText(item: MessageItem): string {
-  return item.content
-    .filter((block) => block.type === "input_text")
-    .map((block) => block.text)
-    .join("\n")
-    .trim();
-}
-
-async function loadUserMessages(sessionId: string): Promise<MessageItem[]> {
-  let items: MessageItem[] = [];
-  let olderThan: string | undefined;
-  while (true) {
-    // Each page's cursor comes from the previous one, so paging is sequential.
-    // oxlint-disable-next-line no-await-in-loop
-    const page = await fetchSessionItemsPage(sessionId, { olderThan, limit: 1000 });
-    items = [
-      ...page.items.filter(
-        (item): item is MessageItem =>
-          isMessageItem(item) &&
-          item.role === "user" &&
-          item.is_meta !== true &&
-          !isSystemUserContent(item.content),
+/** Re-download the reverted prompt's files; returns those that loaded. */
+async function loadAttachments(
+  sessionId: string,
+  attachments: RevertAttachment[],
+): Promise<{ files: File[]; missing: number }> {
+  const results = await Promise.allSettled(
+    attachments.map((attachment, index) =>
+      fetchSessionFile(
+        sessionId,
+        attachment.file_id,
+        attachment.filename ?? `attachment-${index + 1}`,
       ),
-      ...items,
-    ];
-    if (!page.hasMore || page.items.length === 0) break;
-    olderThan = page.items[0].id;
-  }
-  return items.reverse();
+    ),
+  );
+  const files = results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+  return { files, missing: results.length - files.length };
 }
 
 export function RevertSessionDialog({
@@ -69,16 +60,23 @@ export function RevertSessionDialog({
     isLoading: loading,
     error: loadError,
   } = useQuery({
-    queryKey: ["session", sourceSessionId, "revert-messages"],
-    queryFn: () => loadUserMessages(sourceSessionId),
+    queryKey: ["session", sourceSessionId, "revert-points"],
+    queryFn: () => fetchRevertPoints(sourceSessionId),
     enabled: open,
   });
+  // A clicked message the server doesn't offer is never swapped for another.
+  const initialUnavailable =
+    !!initialUserMessageId &&
+    !loading &&
+    !messages.some((message) => message.id === initialUserMessageId);
 
   useEffect(() => {
     if (!open || loading) return;
     setSelectedId(
-      initialUserMessageId && messages.some((message) => message.id === initialUserMessageId)
-        ? initialUserMessageId
+      initialUserMessageId
+        ? messages.some((message) => message.id === initialUserMessageId)
+          ? initialUserMessageId
+          : null
         : (messages[0]?.id ?? null),
     );
   }, [initialUserMessageId, loading, messages, open]);
@@ -86,29 +84,56 @@ export function RevertSessionDialog({
   useEffect(() => {
     if (!open) {
       queryClient.removeQueries({
-        queryKey: ["session", sourceSessionId, "revert-messages"],
+        queryKey: ["session", sourceSessionId, "revert-points"],
       });
       setError(null);
     }
   }, [open, queryClient, sourceSessionId]);
 
-  const errorMessage = error ?? loadError?.message ?? null;
+  const errorMessage =
+    error ??
+    loadError?.message ??
+    (initialUnavailable ? "That message can't be reverted to. Choose another one." : null);
 
   async function handleRevert(): Promise<void> {
     if (!selectedId || submitting) return;
     setSubmitting(true);
     setError(null);
+    noteLocalRevert(sourceSessionId, selectedId);
+    let result: Awaited<ReturnType<typeof revertSession>>;
     try {
-      const result = await revertSession(sourceSessionId, selectedId);
+      result = await revertSession(sourceSessionId, selectedId);
+    } catch (reason) {
+      consumeLocalRevert(sourceSessionId, selectedId);
+      setError(reason instanceof Error ? reason.message : "Couldn't revert the session.");
+      setSubmitting(false);
+      return;
+    }
+    try {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["session", sourceSessionId], exact: true });
+      const { files, missing } = await loadAttachments(sourceSessionId, result.attachments);
       // Hand the prompt back before reloading: the remounted composer reads it
       // from the draft store, and a mounted one adopts it immediately.
-      replaceSessionDraft(sourceSessionId, result.draft);
+      replaceSessionDraft(sourceSessionId, result.draft, files);
       await useChatStore.getState().switchTo(sourceSessionId, { reload: true });
       onOpenChange(false);
       toast.success("Conversation reverted. Edit the message and send it again.");
+      if (missing > 0) {
+        toast.warning(
+          missing === 1
+            ? "One attachment couldn't be restored. Attach it again before sending."
+            : `${missing} attachments couldn't be restored. Attach them again before sending.`,
+        );
+      }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Couldn't revert the session.");
+      // The revert itself succeeded; only the local reload failed.
+      onOpenChange(false);
+      toast.error(
+        reason instanceof Error
+          ? `Conversation reverted, but reloading it failed: ${reason.message}`
+          : "Conversation reverted, but reloading it failed. Refresh the page.",
+      );
     } finally {
       setSubmitting(false);
     }
@@ -140,7 +165,7 @@ export function RevertSessionDialog({
             <p className="p-4 text-center text-muted-foreground">No user messages to revert to.</p>
           ) : (
             messages.map((message) => {
-              const text = messageText(message) || "(attachments only)";
+              const text = message.text.trim() || "(attachments only)";
               const active = selectedId === message.id;
               return (
                 <label

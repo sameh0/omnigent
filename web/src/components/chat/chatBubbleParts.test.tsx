@@ -208,6 +208,14 @@ describe("UserBubble edit from here", () => {
     { name: "the viewer can't edit the session", opts: { canRevert: false } },
     { name: "the message is a side chat's", opts: { scope: "conv_side" } },
     { name: "the message isn't committed yet", opts: { userBubble: { ...bubble, pending: true } } },
+    {
+      name: "the bubble has no stored item id",
+      opts: { userBubble: { ...bubble, itemId: "user_3", syntheticItemId: true } },
+    },
+    {
+      name: "the bubble is a shell command",
+      opts: { userBubble: { ...bubble, shellCommand: "ls" } },
+    },
   ])("is hidden when $name", ({ opts }) => {
     renderUserBubble(opts);
 

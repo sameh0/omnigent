@@ -2,31 +2,35 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
+from omnigent_ui_sdk import RichBlockFormatter
 
 from omnigent.repl import _repl as repl_mod
+from tests.repl.helpers import CapturingHost
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_revert_command_registered_and_filters_system_messages() -> None:
-    """``/revert`` is discoverable and only offers real user prompts."""
-
-    def message(item_id: str, text: str, **extra: object) -> dict[str, object]:
-        return {
-            "id": item_id,
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": text}],
-            **extra,
-        }
+async def test_revert_lists_the_servers_revert_points() -> None:
+    """``/revert`` offers exactly the messages the server says are selectable."""
+    sessions = SimpleNamespace(
+        revert_points=AsyncMock(return_value=[]),
+        revert=AsyncMock(),
+    )
+    host = CapturingHost()
 
     assert "/revert" in repl_mod.COMMANDS
-    candidates = repl_mod._revert_user_messages(
-        [
-            message("msg_real", "retry me"),
-            message("msg_system", "[System: timer fired]"),
-            message("msg_meta", "hidden", is_meta=True),
-        ]
+    await repl_mod.handle_slash_command(
+        "/revert",
+        SimpleNamespace(session_id="conv_main"),  # type: ignore[arg-type]
+        SimpleNamespace(sessions=sessions),  # type: ignore[arg-type]
+        host,
+        RichBlockFormatter(),  # type: ignore[arg-type]
     )
-    assert [item["id"] for item in candidates] == ["msg_real"]
+
+    sessions.revert_points.assert_awaited_once_with("conv_main")
+    sessions.revert.assert_not_awaited()
+    assert "No user messages to revert to." in host.text

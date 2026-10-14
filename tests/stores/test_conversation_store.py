@@ -5640,6 +5640,33 @@ def test_rewind_conversation_removes_selected_prompt_and_later_history(
     assert [item.id for item in conversation_store.search("Q1", conversation_id=source.id)] == [
         rewound_items[0].id
     ]
+    assert conversation_store.search("Q2", conversation_id=source.id) == []
+
+
+def test_rewind_conversation_refuses_when_items_arrived_after_the_snapshot(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A rewind against a stale snapshot changes nothing, native id included."""
+    from omnigent.stores.conversation_store import ConversationChangedError
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_external_session_id(source.id, "native-session-old")
+    _append_three_responses(conversation_store, source.id)
+    items = conversation_store.list_items(source.id).data
+
+    with pytest.raises(ConversationChangedError):
+        conversation_store.rewind_conversation(
+            source.id,
+            before_item_id=items[2].id,
+            expected_last_item_id=items[4].id,
+        )
+
+    assert [item.id for item in conversation_store.list_items(source.id).data] == [
+        item.id for item in items
+    ]
+    unchanged = conversation_store.get_conversation(source.id)
+    assert unchanged is not None
+    assert unchanged.external_session_id == "native-session-old"
 
 
 def test_fork_conversation_truncated_drops_external_session_directive(

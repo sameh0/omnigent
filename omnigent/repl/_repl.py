@@ -5787,35 +5787,18 @@ async def _cmd_fork(
     )
 
 
-def _revert_user_messages(items: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Return selectable, non-meta user messages newest first."""
-    return [
-        item
-        for item in reversed(items)
-        if item.get("type") == "message"
-        and item.get("role") == "user"
-        and not item.get("is_meta")
-        and not _extract_message_text(item).lstrip().startswith("[System:")
-        and isinstance(item.get("id"), str)
-    ]
-
-
-async def _pick_revert_message(items: list[dict[str, object]]) -> str | None:
+async def _pick_revert_message(points: list[dict[str, object]]) -> str | None:
     """Open the prompt-toolkit message picker for ``/revert``."""
     from prompt_toolkit.application import run_in_terminal
     from prompt_toolkit.shortcuts import radiolist_dialog
 
-    candidates = _revert_user_messages(items)
-    if not candidates:
-        return None
-
     def choose_message() -> str | None:
         values = []
-        for item in candidates:
-            text = " ".join(_extract_message_text(item).split()) or "(attachments only)"
+        for point in points:
+            text = " ".join(str(point.get("text") or "").split()) or "(attachments only)"
             if len(text) > 88:
                 text = text[:87].rstrip() + "…"
-            values.append((str(item["id"]), text))
+            values.append((str(point["id"]), text))
         return radiolist_dialog(
             title="Revert conversation",
             text="Choose the user message to return to.",
@@ -5843,14 +5826,15 @@ async def _cmd_revert(
         host.output(Text("  Usage: /revert [user-message-id]", style="bold red"))
         return
     try:
-        items = await _list_all_conversation_items(client, current_id)
         if args:
             selected = args[0]
-        elif not _revert_user_messages(items):
-            host.output(Text(f"  [{fmt.muted}]No user messages to revert to.[/{fmt.muted}]"))
-            return
         else:
-            selected = await _pick_revert_message(items)
+            points = await client.sessions.revert_points(current_id)
+            if not points:
+                message = f"  [{fmt.muted}]No user messages to revert to.[/{fmt.muted}]"
+                host.output(Text.from_markup(message))
+                return
+            selected = await _pick_revert_message(points)
         if selected is None:
             return
         result = await client.sessions.revert(current_id, selected)
@@ -5872,6 +5856,16 @@ async def _cmd_revert(
     draft = result.get("draft")
     if isinstance(draft, str) and draft:
         host.output(Text.from_markup(f"\n  [bold]Message to retry[/]\n  {escape(draft)}"))
+    attachments = result.get("attachments")
+    if isinstance(attachments, list) and attachments:
+        names = ", ".join(
+            str(attachment.get("filename") or attachment.get("file_id"))
+            for attachment in attachments
+            if isinstance(attachment, dict)
+        )
+        host.output(
+            Text.from_markup(f"  [{fmt.muted}]It had attachments: {escape(names)}[/{fmt.muted}]")
+        )
 
 
 @_cmd("/history", "Show current conversation history")

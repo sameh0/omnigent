@@ -45,6 +45,7 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { noteLocalRevert } from "@/lib/sessionRevert";
 import {
   setOmnigentHostConfig,
   type OmnigentAnalyticsEvent,
@@ -1128,6 +1129,37 @@ describe("chatStore — switchTo", () => {
       original.slice(0, 2).map((item) => item.id),
     );
     expect(state.loadingConversation).toBe(false);
+  });
+
+  it("a revert made elsewhere reloads the open transcript; this tab's own is skipped", async () => {
+    const original = [
+      userMessage("resp_1", "keep"),
+      assistantMessage("resp_1", "kept response"),
+      userMessage("resp_2", "discard"),
+    ];
+    seedSession("conv_rewind", original);
+    await useChatStore.getState().switchTo("conv_rewind");
+    seedSession("conv_rewind", original.slice(0, 2));
+    const reverted = {
+      type: "session_reverted",
+      conversationId: "conv_rewind",
+      userMessageId: original[2].id,
+    } as const;
+
+    noteLocalRevert("conv_rewind", original[2].id);
+    handleSessionEvent(reverted);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(useChatStore.getState().blocks).toHaveLength(3);
+
+    handleSessionEvent(reverted);
+
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual(
+        original.slice(0, 2).map((item) => item.id),
+      ),
+    );
   });
 
   it("hydrates blocks from the session snapshot when switching to a real conv id", async () => {
