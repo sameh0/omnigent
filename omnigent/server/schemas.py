@@ -2690,6 +2690,56 @@ class SessionForkRequest(BaseModel):
         return self
 
 
+class SessionRevertRequest(BaseModel):
+    """Request to rewind a session to before a past user message."""
+
+    user_message_id: str = Field(min_length=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionRevertAttachment(BaseModel):
+    """A file the reverted prompt carried, for re-attaching to the draft.
+
+    :param type: The original content block type.
+    :param file_id: Session file id, e.g. ``"file_abc123"``; its content stays
+        readable after the revert.
+    :param filename: Original filename, when the block recorded one.
+    """
+
+    type: Literal["input_image", "input_file"]
+    file_id: str
+    filename: str | None = None
+
+
+class SessionRevertResponse(BaseModel):
+    """Selected prompt returned to the client as an editable draft."""
+
+    draft: str
+    attachments: list[SessionRevertAttachment] = Field(default_factory=list)
+
+
+class SessionRevertPoint(BaseModel):
+    """A user message a session can be reverted to.
+
+    :param id: The message item id to pass as ``user_message_id``.
+    :param text: The message text, e.g. ``"Fix the login bug"``.
+    :param has_attachments: Whether the message carried images or files.
+    :param created_at: Unix seconds the message was stored.
+    """
+
+    id: str
+    text: str
+    has_attachments: bool
+    created_at: int | None = None
+
+
+class SessionRevertPointsResponse(BaseModel):
+    """The user messages a session can be reverted to, newest first."""
+
+    data: list[SessionRevertPoint]
+
+
 class ReadStatePutRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{session_id}/read-state``.
@@ -3696,6 +3746,24 @@ class SessionCreatedEvent(_SSEEventBase):
     child_session_id: str
     agent_id: str | None = None
     parent_session_id: str | None = None
+
+
+class SessionRevertedEvent(_SSEEventBase):
+    """
+    The session was reverted: a user message and everything after it were
+    deleted from its history.
+
+    Category: **transient** (SSE-only). A warm client can't express the
+    deletion from its stream, so it reloads the session snapshot.
+
+    :param type: Always ``"session.reverted"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param user_message_id: The first deleted item, e.g. ``"msg_abc123"``.
+    """
+
+    type: Literal["session.reverted"]
+    conversation_id: str
+    user_message_id: str
 
 
 class SessionSupersededEvent(_SSEEventBase):
@@ -4768,6 +4836,7 @@ ServerStreamEvent = Annotated[
     | SessionInterruptedEvent
     | SessionCreatedEvent
     | SessionSupersededEvent
+    | SessionRevertedEvent
     | SessionBtwSidechatEvent
     | SessionPresenceEvent
     # ── Transient (SSE-only) — session resource lifecycle ─────

@@ -5529,6 +5529,7 @@
             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
+            "session.reverted": "#/components/schemas/SessionRevertedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
             "session.status": "#/components/schemas/SessionStatusEvent",
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
@@ -5598,6 +5599,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionSupersededEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionRevertedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionBtwSidechatEvent"
@@ -7795,6 +7799,178 @@
           "created_at"
         ],
         "title": "SessionResponse",
+        "type": "object"
+      },
+      "SessionRevertAttachment": {
+        "description": "A file the reverted prompt carried, for re-attaching to the draft.",
+        "properties": {
+          "file_id": {
+            "description": "Session file id, e.g. `\"file_abc123\"`; its content stays readable after the revert.",
+            "title": "File Id",
+            "type": "string"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Original filename, when the block recorded one.",
+            "title": "Filename"
+          },
+          "type": {
+            "description": "The original content block type.",
+            "enum": [
+              "input_image",
+              "input_file"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "file_id"
+        ],
+        "title": "SessionRevertAttachment",
+        "type": "object"
+      },
+      "SessionRevertPoint": {
+        "description": "A user message a session can be reverted to.",
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix seconds the message was stored.",
+            "title": "Created At"
+          },
+          "has_attachments": {
+            "description": "Whether the message carried images or files.",
+            "title": "Has Attachments",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "The message item id to pass as `user_message_id`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "text": {
+            "description": "The message text, e.g. `\"Fix the login bug\"`.",
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "text",
+          "has_attachments"
+        ],
+        "title": "SessionRevertPoint",
+        "type": "object"
+      },
+      "SessionRevertPointsResponse": {
+        "description": "The user messages a session can be reverted to, newest first.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SessionRevertPoint"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "SessionRevertPointsResponse",
+        "type": "object"
+      },
+      "SessionRevertRequest": {
+        "additionalProperties": false,
+        "description": "Request to rewind a session to before a past user message.",
+        "properties": {
+          "user_message_id": {
+            "minLength": 1,
+            "title": "User Message Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_message_id"
+        ],
+        "title": "SessionRevertRequest",
+        "type": "object"
+      },
+      "SessionRevertResponse": {
+        "description": "Selected prompt returned to the client as an editable draft.",
+        "properties": {
+          "attachments": {
+            "items": {
+              "$ref": "#/components/schemas/SessionRevertAttachment"
+            },
+            "title": "Attachments",
+            "type": "array"
+          },
+          "draft": {
+            "title": "Draft",
+            "type": "string"
+          }
+        },
+        "required": [
+          "draft"
+        ],
+        "title": "SessionRevertResponse",
+        "type": "object"
+      },
+      "SessionRevertedEvent": {
+        "description": "The session was reverted: a user message and everything after it were\ndeleted from its history.\n\nCategory: **transient** (SSE-only). A warm client can't express the\ndeletion from its stream, so it reloads the session snapshot.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.reverted",
+            "description": "Always `\"session.reverted\"`.",
+            "title": "Type",
+            "type": "string"
+          },
+          "user_message_id": {
+            "description": "The first deleted item, e.g. `\"msg_abc123\"`.",
+            "title": "User Message Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "user_message_id"
+        ],
+        "title": "SessionRevertedEvent",
         "type": "object"
       },
       "SessionSandboxStatusEvent": {
@@ -16378,6 +16554,102 @@
           }
         },
         "summary": "Fork Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{source_id}/revert": {
+      "post": {
+        "description": "Rewind one session to immediately before a selected user message.",
+        "operationId": "revert_session_v1_sessions__source_id__revert_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionRevertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRevertResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revert Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{source_id}/revert-points": {
+      "get": {
+        "description": "List the user messages this session can be reverted to, newest first.",
+        "operationId": "list_revert_points_v1_sessions__source_id__revert_points_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRevertPointsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Revert Points",
         "tags": [
           "sessions"
         ]

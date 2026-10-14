@@ -1327,6 +1327,29 @@ def insert_fts_bulk(
         )
 
 
+def delete_fts_by_item_ids(session: Session, item_ids: list[str]) -> None:
+    """
+    Remove the FTS rows of specific items (SQLite-family dialects only).
+
+    No-op when ``item_ids`` is empty or the dialect lacks FTS5.
+
+    :param session: An active SQLAlchemy session.
+    :param item_ids: Item IDs whose FTS rows should be removed.
+    """
+    if not item_ids:
+        return
+    if not (session.bind and _supports_fts5(session.bind.dialect.name)):
+        return
+    _CHUNK_SIZE = 500
+    for chunk_start in range(0, len(item_ids), _CHUNK_SIZE):
+        chunk = item_ids[chunk_start : chunk_start + _CHUNK_SIZE]
+        placeholders = ", ".join(f":iid{i}" for i in range(len(chunk)))
+        session.execute(
+            text(f"DELETE FROM {_FTS_TABLE} WHERE item_id IN ({placeholders})"),
+            {f"iid{i}": item_id for i, item_id in enumerate(chunk)},
+        )
+
+
 def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
     """
     Remove all FTS rows for a conversation (SQLite-family dialects only).

@@ -157,6 +157,72 @@ describe("AssistantBubble fork source", () => {
   });
 });
 
+describe("UserBubble edit from here", () => {
+  const bubble: Extract<Bubble, { kind: "user" }> = {
+    kind: "user",
+    itemId: "msg_prompt",
+    content: [{ type: "input_text", text: "try again differently" }],
+    createdAtS: 1_700_000_000,
+  };
+
+  function renderUserBubble({
+    canRevert = true,
+    scope = null,
+    userBubble = bubble,
+  }: {
+    canRevert?: boolean;
+    scope?: string | null;
+    userBubble?: Extract<Bubble, { kind: "user" }>;
+  } = {}) {
+    const openRevertDialog = vi.fn();
+    useChatStore.setState({ conversationId: "conv_main" });
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider
+          value={{
+            currentSessionId: "conv_main",
+            canFork: true,
+            openForkDialog: vi.fn(),
+            canRevert,
+            openRevertDialog,
+          }}
+        >
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={userBubble} isLastAssistant={false} />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+    return openRevertDialog;
+  }
+
+  it("opens the revert picker on this message", () => {
+    const openRevertDialog = renderUserBubble();
+
+    fireEvent.click(screen.getByTestId("revert-from-message"));
+
+    expect(openRevertDialog).toHaveBeenCalledWith({ userMessageId: "msg_prompt" });
+  });
+
+  it.each([
+    { name: "the viewer can't edit the session", opts: { canRevert: false } },
+    { name: "the message is a side chat's", opts: { scope: "conv_side" } },
+    { name: "the message isn't committed yet", opts: { userBubble: { ...bubble, pending: true } } },
+    {
+      name: "the bubble has no stored item id",
+      opts: { userBubble: { ...bubble, itemId: "user_3", syntheticItemId: true } },
+    },
+    {
+      name: "the bubble is a shell command",
+      opts: { userBubble: { ...bubble, shellCommand: "ls" } },
+    },
+  ])("is hidden when $name", ({ opts }) => {
+    renderUserBubble(opts);
+
+    expect(screen.queryByTestId("revert-from-message")).toBeNull();
+  });
+});
+
 describe("message navigation highlight", () => {
   const text = "Highlight only this message content";
   const messageId = "highlight_target";
