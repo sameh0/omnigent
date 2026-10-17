@@ -2,6 +2,7 @@ import { filterSessionScope } from "@/lib/sessionVisibility";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
+import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
 import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
 import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
@@ -283,6 +284,8 @@ import AntigravityColor from "@lobehub/icons/es/Antigravity/components/Color";
 import DevinColor from "@lobehub/icons/es/Devin/components/Color";
 import KiroColor from "@lobehub/icons/es/Kiro/components/Color";
 import { type PullRequest, usePullRequestInfo } from "@/hooks/usePullRequests";
+import { matchWorktree } from "@/hooks/useHostWorktrees";
+import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import {
   deriveRepoName,
   localMachineLabel,
@@ -1807,6 +1810,8 @@ function ConversationList({
   // Scope key for pagination and auto-load: either filter changing starts over.
   const listScopeKey = hostFilter === ALL_HOSTS ? activeTab : `${activeTab}|${hostFilter}`;
 
+  const workingIds = useSidebarWorkingIds(allConversations, startingId, statusView);
+
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
   const { data: projects = [] } = useProjects();
@@ -1933,12 +1938,6 @@ function ConversationList({
           : activeTab === "mine"
             ? notArchived.filter((c) => isOwnedByViewer(c, viewerId))
             : notArchived;
-    // The machine filter narrows only the flat lists, like the tab: pins and
-    // project folders stay put.
-    const hostScoped =
-      hostFilter === ALL_HOSTS
-        ? tabScoped
-        : tabScoped.filter((c) => matchesSessionHostFilter(c, hostFilter, hostsById));
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
@@ -1993,7 +1992,13 @@ function ConversationList({
     // The remainder — not pinned, not filed — splits into Shared (other owners')
     // and Sessions (the viewer's own).
     const allOrdered = sortConversations(
-      hostScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
+      // The machine filter narrows only the flat list: pins and folders stay put.
+      tabScoped.filter(
+        (c) =>
+          !pinnedIdSet.has(c.id) &&
+          !filedIds.has(c.id) &&
+          (hostFilter === ALL_HOSTS || matchesSessionHostFilter(c, hostFilter, hostsById)),
+      ),
       activeOverride,
       frozenKeys,
       sortBy,
@@ -2003,8 +2008,10 @@ function ConversationList({
       if (frozen) return frozen;
       const unseen = isConversationUnseen(c.id, c.updated_at, c.status);
       const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
-      // Like the row's spinner, the open session is Working while it starts up.
-      const live = bucket !== "Needs attention" && c.id === startingId ? "Working" : bucket;
+      const live =
+        bucket !== "Needs attention" && (c.id === startingId || workingIds.has(c.id))
+          ? "Working"
+          : bucket;
       frozenStatus?.set(c.id, live);
       return live;
     };
@@ -2058,6 +2065,7 @@ function ConversationList({
     unseenTick,
     draftIds,
     startingId,
+    workingIds,
   ]);
 
   const config = useContext(SidebarConfigContext);
@@ -2084,12 +2092,17 @@ function ConversationList({
     };
   }, [loadedSections, displayPagination.rows]);
   // The paginated Sessions rows split into titled groups; null keeps the single
-  // "Sessions" section (default grouping, or nothing to group).
+  // "Sessions" section (default/date grouping with nothing to group).
   const sessionGroups = useMemo(() => {
     const titles = loadedSections.groupTitles;
-    if (!titles || sections.sessions.length === 0) return null;
-    return groupConversations(sections.sessions, (c) => titles.get(c.id), groupOrder);
-  }, [loadedSections.groupTitles, sections.sessions, groupOrder]);
+    if (!titles || (sections.sessions.length === 0 && !statusView)) return null;
+    return groupConversations(
+      sections.sessions,
+      (c) => titles.get(c.id),
+      groupOrder,
+      statusView ? "Working" : undefined,
+    );
+  }, [loadedSections.groupTitles, sections.sessions, groupOrder, statusView]);
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
   // + bulk-action bar). Only one is true at a time unless the selection is unified.
@@ -2902,8 +2915,20 @@ function ConversationList({
                           {sessionGroups.map((group, index) => (
                             <ConversationSection
                               key={group.title}
-                              title={group.title}
+                              title={
+                                index === 0
+                                  ? group.title
+                                  : group.title.replace(
+                                      /^(?:Created|Updated) (.)/,
+                                      (_, initial: string) => initial.toUpperCase(),
+                                    )
+                              }
                               conversations={group.conversations}
+                              emptyMessage={
+                                group.title === "Working" && !sessionStatus
+                                  ? emptyMessage
+                                  : undefined
+                              }
                               footer={
                                 index === sessionGroups.length - 1 ? sessionStatus : undefined
                               }
@@ -2922,12 +2947,12 @@ function ConversationList({
                           title="Sessions"
                           conversations={sections.sessions}
                           emptyMessage={
-                            sessionStatus
-                              ? undefined
-                              : hostFilter === ALL_HOSTS
-                                ? SIDEBAR_FILTER_EMPTY[activeTab]
-                                : "No sessions on this machine"
-                          }
+                        sessionStatus
+                          ? undefined
+                          : hostFilter === ALL_HOSTS
+                            ? SIDEBAR_FILTER_EMPTY[activeTab]
+                            : "No sessions on this machine"
+                      }
                           footer={sessionStatus}
                           collapsed={effectiveCollapsedSections.includes("Chats")}
                           onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
@@ -3353,7 +3378,14 @@ function SessionFilterMenu({
   view: SidebarViewPreferences | null;
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
-  const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
+  const baseLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
+  const hostFiltered = hostValue !== ALL_HOSTS;
+  // A stale pick stays listed (see sessionHostFilterOptions), so it can be undone.
+  const showHosts = hostOptions.length > 1 || hostFiltered;
+  // The machine filter hides rows, so make it visible while it's on.
+  const triggerLabel = hostFiltered
+    ? `${baseLabel} · ${hostOptions.find((option) => option.value === hostValue)?.label ?? ""}`
+    : baseLabel;
   const filters = multiUser
     ? SIDEBAR_FILTERS
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
@@ -3370,13 +3402,7 @@ function SessionFilterMenu({
       ))}
     </DropdownMenuRadioGroup>
   );
-  const hostFiltered = hostValue !== ALL_HOSTS;
-  const hostLabel = hostOptions.find((option) => option.value === hostValue)?.label;
-  // A stale pick stays listed (see sessionHostFilterOptions), so it can be undone.
-  const showHosts = hostOptions.length > 1 || hostFiltered;
-  // The machine filter hides rows, so make it visible while it's on.
-  const tooltip = hostFiltered ? `${triggerLabel} · ${hostLabel ?? ""}` : triggerLabel;
-  const hostOptionsGroup = (
+  const hostOptionItems = (
     <DropdownMenuRadioGroup
       value={hostValue}
       onValueChange={(next) => onHostChange(next as SessionHostFilter)}
@@ -3415,7 +3441,7 @@ function SessionFilterMenu({
                 type="button"
                 variant="ghost"
                 size="icon-xs"
-                aria-label={tooltip}
+                aria-label={triggerLabel}
                 data-testid="session-filter"
                 data-active={String(hostFiltered)}
                 className={cn(
@@ -3433,7 +3459,7 @@ function SessionFilterMenu({
           </span>
         </TooltipTrigger>
         <TooltipContent side="bottom" data-noninteractive-tooltip>
-          {tooltip}
+          {triggerLabel}
         </TooltipContent>
       </Tooltip>
       {view === null ? (
@@ -3444,10 +3470,8 @@ function SessionFilterMenu({
           {showHosts && (
             <>
               <DropdownMenuSeparator />
-              <DropdownMenuLabel className="text-muted-foreground text-sm">
-                Machine
-              </DropdownMenuLabel>
-              {hostOptionsGroup}
+              <DropdownMenuLabel className="text-muted-foreground text-sm">Machine</DropdownMenuLabel>
+              {hostOptionItems}
             </>
           )}
         </DropdownMenuContent>
@@ -3483,10 +3507,14 @@ function SessionFilterMenu({
           {showHosts && (
             <FilterMenuSub
               label="Machine"
-              value={hostFiltered ? hostLabel : "All"}
+              value={
+                hostFiltered
+                  ? hostOptions.find((option) => option.value === hostValue)?.label
+                  : "All machines"
+              }
               testId="session-host-menu"
             >
-              {hostOptionsGroup}
+              {hostOptionItems}
             </FilterMenuSub>
           )}
           <FilterMenuSub
@@ -4400,7 +4428,7 @@ function SessionMetaLine({
           {i > 0 && <span aria-hidden>·</span>}
           <span className="flex min-w-0 items-center gap-1">
             <Icon aria-hidden className="size-3.5 shrink-0" />
-            <span className="truncate">{value}</span>
+            <span className={key === "environment" ? "sr-only" : "truncate"}>{value}</span>
           </span>
         </Fragment>
       ))}
@@ -4836,7 +4864,19 @@ function ConversationRowImpl({
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
   const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
-  const metaBranch = show.includes("branch") ? gitBranch : null;
+  const loadBranch = show.includes("branch") && gitBranch === null;
+  const { data: worktrees } = useSessionWorktrees(
+    loadBranch ? conversation.id : null,
+    loadBranch ? conversation.host_id : null,
+    loadBranch ? conversation.workspace : null,
+  );
+  const workspaceWorktree =
+    loadBranch && worktrees?.status === "ok" && conversation.workspace
+      ? matchWorktree(worktrees.worktrees, conversation.workspace)
+      : null;
+  const metaBranch = show.includes("branch")
+    ? (gitBranch ?? (workspaceWorktree?.detached ? null : (workspaceWorktree?.branch ?? null)))
+    : null;
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
   // the row, or on the title line — padding + half its 20px box — above a meta line.
   const overlayTop =
