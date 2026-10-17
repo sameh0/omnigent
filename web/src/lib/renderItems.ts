@@ -165,6 +165,8 @@ export type Bubble =
   | {
       kind: "user";
       itemId: string;
+      /** `itemId` is a positional placeholder, not a stored item's id. */
+      syntheticItemId?: boolean;
       /** Queued input that does not yet have a persisted transcript item. */
       pending?: boolean;
       /** Pending input sent mid-turn that the agent hasn't read yet. */
@@ -869,6 +871,7 @@ function walkBubbles(
       bubbles.push({
         kind: "user",
         itemId: b.ctx.itemId ?? `user_${i}`,
+        ...(b.ctx.itemId === undefined ? { syntheticItemId: true } : {}),
         content:
           b.type === "user_message" ? b.content : [{ type: "input_text", text: `!${b.input}` }],
         ...(b.type === "terminal_command" ? { shellCommand: b.input } : {}),
@@ -1862,6 +1865,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "user" && b.kind === "user") {
     if (
       a.itemId !== b.itemId ||
+      Boolean(a.syntheticItemId) !== Boolean(b.syntheticItemId) ||
       Boolean(a.pending) !== Boolean(b.pending) ||
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
       a.createdBy !== b.createdBy ||

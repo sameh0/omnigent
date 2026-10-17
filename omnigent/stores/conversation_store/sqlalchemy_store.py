@@ -65,6 +65,7 @@ from omnigent.db.utils import (
     _supports_fts5,
     build_search_snippet,
     delete_fts_by_conversation_ids,
+    delete_fts_by_item_ids,
     ensure_fts_table,
     extract_search_text,
     generate_conversation_id,
@@ -93,6 +94,7 @@ from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    _RUNTIME_INSTANCE_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     FORK_CARRY_HISTORY_LABEL_KEY,
@@ -101,6 +103,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationAlreadyExistsError,
+    ConversationChangedError,
     ConversationNotFoundError,
     ConversationStore,
     ConversationUpdateResult,
@@ -4471,6 +4474,134 @@ class SqlAlchemyConversationStore(ConversationStore):
             agent_row,
             prepared_labels,
         )
+
+    def rewind_conversation(
+        self,
+        conversation_id: str,
+        *,
+        before_item_id: str,
+        expected_last_item_id: str | None = None,
+        carry_history_into_native: bool = False,
+    ) -> Conversation:
+        """Delete a selected item and all later items from one conversation."""
+        now = now_epoch()
+        workspace_id = current_workspace_id()
+
+        # The native session id lives in the Omnigent DB, which may be a
+        # different database, so clear it first and restore it if the rewind
+        # fails: a stale id would resume the discarded native transcript.
+        def clear_external_session_id(session: Session) -> str | None:
+            meta_query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == workspace_id,
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                meta_query = meta_query.with_for_update()
+            metadata = session.execute(meta_query).scalar_one_or_none()
+            if metadata is None:
+                return None
+            previous = metadata.external_session_id
+            metadata.external_session_id = None
+            return previous
+
+        def rewind(session: Session) -> None:
+            conv_query = select(SqlConversation).where(
+                SqlConversation.workspace_id == workspace_id,
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                conv_query = conv_query.with_for_update()
+            conversation = session.execute(conv_query).scalar_one_or_none()
+            if conversation is None:
+                raise LookupError(f"conversation not found: {conversation_id!r}")
+            in_conversation = (
+                SqlConversationItem.workspace_id == workspace_id,
+                SqlConversationItem.conversation_id == conversation_id,
+            )
+            target_position = session.execute(
+                select(SqlConversationItem.position).where(
+                    *in_conversation,
+                    SqlConversationItem.id == before_item_id,
+                )
+            ).scalar_one_or_none()
+            if target_position is None:
+                raise LookupError(
+                    f"item not found in conversation {conversation_id!r}: {before_item_id!r}"
+                )
+            if expected_last_item_id is not None:
+                last_item_id = session.execute(
+                    select(SqlConversationItem.id)
+                    .where(*in_conversation)
+                    .order_by(SqlConversationItem.position.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if last_item_id != expected_last_item_id:
+                    raise ConversationChangedError(
+                        f"conversation {conversation_id!r} changed during the rewind"
+                    )
+
+            # ponytail: child sessions lack an origin item id; add that link before
+            # cascading post-rewind children instead of guessing from timestamps.
+            removed_ids = list(
+                session.execute(
+                    select(SqlConversationItem.id).where(
+                        *in_conversation,
+                        SqlConversationItem.position >= target_position,
+                    )
+                ).scalars()
+            )
+            delete_fts_by_item_ids(session, removed_ids)
+            session.execute(
+                delete(SqlConversationItem).where(
+                    *in_conversation,
+                    SqlConversationItem.position >= target_position,
+                )
+            )
+
+            conversation.next_position = target_position
+            conversation.updated_at = now
+            reset_label_keys = _RUNTIME_INSTANCE_LABEL_KEYS | {
+                FORK_CARRY_HISTORY_LABEL_KEY,
+                FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+            }
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == workspace_id,
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key.in_(reset_label_keys),
+                )
+            )
+            if carry_history_into_native:
+                _upsert_labels(
+                    session,
+                    conversation_id,
+                    {FORK_CARRY_HISTORY_LABEL_KEY: "1"},
+                    now,
+                )
+
+        previous_external_id = run_write_transaction(
+            self._session_immediate,
+            "clear_rewound_external_session_id",
+            clear_external_session_id,
+        )
+        try:
+            run_write_transaction(self._conv_session_immediate, "rewind_conversation", rewind)
+        except Exception:
+            if previous_external_id is not None:
+                try:
+                    self.set_external_session_id(conversation_id, previous_external_id)
+                except Exception:  # noqa: BLE001 — keep the rewind's own error
+                    _logger.warning(
+                        "Could not restore external_session_id after a failed rewind",
+                        exc_info=True,
+                        extra={"session_id": conversation_id},
+                    )
+            raise
+
+        updated = self.get_conversation(conversation_id)
+        if updated is None:
+            raise LookupError(f"conversation not found: {conversation_id!r}")
+        return updated
 
     def fork_conversation(
         self,

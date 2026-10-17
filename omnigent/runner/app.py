@@ -7578,11 +7578,31 @@ def create_runner_app(
             await process_manager.release(session_id)
         await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id)
+        _session_histories.pop(session_id, None)
+        _last_server_item_id.pop(session_id, None)
         return JSONResponse(
             status_code=200,
             content={
                 "session_id": session_id,
                 "object": "session.state_reset",
+                "reset": True,
+            },
+        )
+
+    @app.post("/v1/sessions/{session_id}/history/reset")
+    async def reset_session_history(session_id: str) -> JSONResponse:
+        # Drops the cached transcript and the harness process (an SDK client
+        # can hold prior turns) so the next turn reloads history from the
+        # server; terminals and other session resources stay up.
+        if process_manager is not None:
+            await process_manager.release(session_id)
+        _session_histories.pop(session_id, None)
+        _last_server_item_id.pop(session_id, None)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "session_id": session_id,
+                "object": "session.history_reset",
                 "reset": True,
             },
         )

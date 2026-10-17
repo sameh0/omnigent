@@ -253,6 +253,18 @@ describe("parseEvent — session.superseded", () => {
   });
 });
 
+describe("parseEvent — session.reverted", () => {
+  it("parses the session and the first deleted item", () => {
+    expect(
+      parseEvent("session.reverted", { conversation_id: "conv_a", user_message_id: "msg_1" }),
+    ).toEqual({ type: "session_reverted", conversationId: "conv_a", userMessageId: "msg_1" });
+  });
+
+  it("returns null when the message id is missing", () => {
+    expect(parseEvent("session.reverted", { conversation_id: "conv_a" })).toBeNull();
+  });
+});
+
 describe("parseEvent — session.status (blocked_on)", () => {
   function blockedOn(data: Record<string, unknown>): string | undefined {
     const ev = parseEvent("session.status", {

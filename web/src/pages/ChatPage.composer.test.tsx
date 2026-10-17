@@ -24,6 +24,7 @@ import {
   clearSessionDrafts,
   getSessionDraft,
   hasSessionDraft,
+  replaceSessionDraft,
   setSessionDraft,
 } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
@@ -378,6 +379,20 @@ describe("Composer session drafts", () => {
     await waitFor(() => expect(textarea()).toHaveValue("draft during startup"));
     expect(getSessionDraft("temp:draft")).toBeUndefined();
     expect(getSessionDraft("conv_real")?.text).toBe("draft during startup");
+  });
+
+  it("adopts a draft replaced from outside, so unmounting can't overwrite it", async () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "half-typed text" } });
+
+    // A revert hands its prompt back while this composer is mounted.
+    act(() => replaceSessionDraft("conv_draft", "edit me and resend"));
+    expect(textarea()).toHaveValue("edit me and resend");
+
+    // The reload that follows unmounts the composer; the reverted prompt
+    // must survive rather than being replaced by the typed text.
+    cleanup();
+    expect(getSessionDraft("conv_draft")?.text).toBe("edit me and resend");
   });
 
   it("restores attached files when switching back to a conversation", async () => {

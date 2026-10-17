@@ -945,6 +945,18 @@ export interface SessionSupersededEvent {
 }
 
 /**
+ * `session.reverted` — a user message and everything after it were deleted
+ * from this session. A warm transcript can't express the deletion, so
+ * clients reload the session.
+ */
+export interface SessionRevertedEvent {
+  type: "session_reverted";
+  conversationId: string;
+  /** The first deleted item. */
+  userMessageId: string;
+}
+
+/**
  * `session.btw_sidechat` — a transient side-chat answer from `/btw` command.
  *
  * Broadcast-only (never persisted, no SSE replay). The answer appears in a
@@ -1029,6 +1041,7 @@ export type StreamEvent =
   | SessionInterruptedEvent
   | SessionCreatedEvent
   | SessionSupersededEvent
+  | SessionRevertedEvent
   | SessionResourceCreatedEvent
   | SessionResourceDeletedEvent
   | SessionChildSessionUpdatedEvent

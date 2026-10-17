@@ -46,6 +46,7 @@ import type {
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSupersededEvent,
+  SessionRevertedEvent,
   SessionViewer,
   SessionTerminalActivityEvent,
   SessionStatusEvent,
@@ -880,6 +881,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       targetConversationId,
       reason: "clear",
     } satisfies SessionSupersededEvent;
+  }
+  if (eventType === "session.reverted") {
+    const conversationId = data.conversation_id;
+    const userMessageId = data.user_message_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (typeof userMessageId !== "string" || !userMessageId) return null;
+    return {
+      type: "session_reverted",
+      conversationId,
+      userMessageId,
+    } satisfies SessionRevertedEvent;
   }
   if (eventType === "session.btw_sidechat") {
     const conversationId = data.conversation_id;

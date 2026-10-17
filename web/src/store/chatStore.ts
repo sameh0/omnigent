@@ -109,6 +109,7 @@ import {
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { consumeLocalRevert } from "@/lib/sessionRevert";
 import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
@@ -1229,7 +1230,12 @@ export interface ChatActions {
     opts?: SendOptions,
   ) => Promise<void>;
   stop: () => void;
-  switchTo: (conversationId: string | null) => Promise<void>;
+  /**
+   * Make `conversationId` the active conversation. `reload` drops its live
+   * entry first so the transcript is rebuilt from the server — needed after a
+   * server-side rewrite (e.g. a revert) that a warm stream can't express.
+   */
+  switchTo: (conversationId: string | null, opts?: { reload?: boolean }) => Promise<void>;
   submitApproval: (
     elicitationId: string,
     action: "accept" | "decline" | "cancel",
@@ -2922,8 +2928,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  switchTo: async (conversationId) => {
-    if (get().conversationId === conversationId) return;
+  switchTo: async (conversationId, opts) => {
+    const reload = opts?.reload === true && conversationId !== null;
+    if (!reload && get().conversationId === conversationId) return;
+    // A reload discards the retained transcript and its stream, so everything
+    // below takes the cold-bind path and re-fetches the server's history.
+    if (reload) conversationRegistry.release(conversationId);
 
     // Whether this conversation is already live AND current decides everything
     // below, so read it before anything can create the entry. A retained entry
@@ -7963,6 +7973,23 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // spin forever. Drop it; resuming starts a fresh turn.
       applyToNamedConversation(event.conversationId, { pendingUserMessages: [] });
       return;
+    case "session_reverted": {
+      // The reverting tab reloads on its own; every other viewer drops the
+      // deleted turns by rebuilding the transcript from the server.
+      const { conversationId } = event;
+      if (consumeLocalRevert(conversationId, event.userMessageId)) return;
+      queryClient?.invalidateQueries({ queryKey: ["session", conversationId] });
+      queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+      // Deferred: this handler runs on the stream the reload tears down.
+      setTimeout(() => {
+        if (useChatStore.getState().conversationId === conversationId) {
+          void useChatStore.getState().switchTo(conversationId, { reload: true });
+        } else {
+          conversationRegistry.release(conversationId);
+        }
+      }, 0);
+      return;
+    }
     case "session_btw_sidechat":
       // Transient /btw sidechat overlay: show the question + answer in a
       // dismissable panel. Guard on active conversation so late events from

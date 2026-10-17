@@ -26,6 +26,8 @@ import {
   openSessionStream,
   postEvent,
   continueFailedTurn,
+  fetchRevertPoints,
+  revertSession,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -388,6 +390,38 @@ describe("createBundledSession", () => {
     expect(result.id).toBe("conv_bundle");
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
+  });
+});
+
+describe("revertSession", () => {
+  it("POSTs the selected user message and returns the draft", async () => {
+    const attachment = { type: "input_image", file_id: "file_1", filename: "a.png" };
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ draft: "retry this", attachments: [attachment] }),
+    );
+
+    const result = await revertSession("conv source", "msg_1");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv%20source/revert");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ user_message_id: "msg_1" });
+    expect(result).toEqual({ draft: "retry this", attachments: [attachment] });
+  });
+
+  it("lists the server's revert points", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        data: [{ id: "msg_2", text: "second", has_attachments: true, created_at: 1 }],
+      }),
+    );
+
+    const points = await fetchRevertPoints("conv source");
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe(
+      "/v1/sessions/conv%20source/revert-points",
+    );
+    expect(points).toEqual([{ id: "msg_2", text: "second", hasAttachments: true }]);
   });
 });
 

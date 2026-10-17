@@ -141,6 +141,7 @@ import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
+import { RevertSessionDialog } from "./RevertSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { resolveDefaultShell } from "./preferredShell";
@@ -764,6 +765,14 @@ export function AppShell() {
     (isKnownTopLevel || isChildSession) &&
     (permissionLevel === null || permissionLevel >= 1);
   const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
+  // Reverting permanently deletes history, so it's owner-only like delete and
+  // archive, and top-level only (the server rejects sub-agents).
+  const canRevert =
+    !!serverConversationId &&
+    isKnownTopLevel &&
+    (permissionLevel === null || isOwnerLevel(permissionLevel));
+  const [revertOpen, setRevertOpen] = useState(false);
+  const [revertUserMessageId, setRevertUserMessageId] = useState<string | null>(null);
   // Agent tools/policies exist to show.
   const hasAgentInfo =
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
@@ -2304,8 +2313,13 @@ export function AppShell() {
         setForkWorkspaceRecovery(opts?.workspaceRecovery ?? false);
         setForkOpen(true);
       },
+      canRevert,
+      openRevertDialog: (opts) => {
+        setRevertUserMessageId(opts?.userMessageId ?? null);
+        setRevertOpen(true);
+      },
     }),
-    [canClone, forkDisabledReason, queryClient, serverConversationId],
+    [canClone, canRevert, forkDisabledReason, queryClient, serverConversationId],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -2702,6 +2716,18 @@ export function AppShell() {
               workspace={activeSession?.workspace ?? activeConv?.workspace}
               open={shareOpen}
               onOpenChange={setShareOpen}
+            />
+          )}
+          {serverConversationId && (
+            <RevertSessionDialog
+              key={`revert-session-dialog-${serverConversationId}`}
+              sourceSessionId={serverConversationId}
+              initialUserMessageId={revertUserMessageId}
+              open={revertOpen}
+              onOpenChange={(open) => {
+                setRevertOpen(open);
+                if (!open) setRevertUserMessageId(null);
+              }}
             />
           )}
           {effectiveForkSourceSessionId && forkSourceReady && (

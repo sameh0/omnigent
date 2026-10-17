@@ -893,6 +893,63 @@ export async function forkSession(
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+/** A user message a session can be reverted to (the server decides which). */
+export interface RevertPoint {
+  id: string;
+  text: string;
+  hasAttachments: boolean;
+}
+
+/** List a session's revert points, newest first. */
+export async function fetchRevertPoints(sessionId: string): Promise<RevertPoint[]> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/revert-points`,
+  );
+  const body = await readJsonOrThrow<{
+    data: { id: string; text: string; has_attachments: boolean }[];
+  }>(res);
+  return body.data.map((point) => ({
+    id: point.id,
+    text: point.text,
+    hasAttachments: point.has_attachments,
+  }));
+}
+
+/** A file the reverted prompt carried. */
+export interface RevertAttachment {
+  type: "input_image" | "input_file";
+  file_id: string;
+  filename: string | null;
+}
+
+/** Rewind a session to immediately before a selected user message. */
+export async function revertSession(
+  sourceId: string,
+  userMessageId: string,
+): Promise<{ draft: string; attachments: RevertAttachment[] }> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/revert`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    body: JSON.stringify({ user_message_id: userMessageId }),
+  });
+  const body = await readJsonOrThrow<{ draft: string; attachments?: RevertAttachment[] }>(res);
+  return { draft: body.draft, attachments: body.attachments ?? [] };
+}
+
+/** Download a session file as a `File`, e.g. to re-attach it to a draft. */
+export async function fetchSessionFile(
+  sessionId: string,
+  fileId: string,
+  filename: string,
+): Promise<File> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(fileId)}/content`,
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  const blob = await res.blob();
+  return new File([blob], filename, { type: blob.type });
+}
+
 /**
  * Fork a generic side chat in the parent's current working directory.
  * Reuse the parent's live runner, relaunching the parent first if it has
