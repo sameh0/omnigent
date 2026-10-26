@@ -5951,6 +5951,96 @@ describe("NewChatLandingScreen", () => {
     expect(await screen.findByRole("tooltip")).toHaveTextContent("Enter a message to get started");
   });
 
+  it.each(["message", "attachment"] as const)(
+    "keeps the missing-directory tooltip readable for a %s draft until dismissed or resolved",
+    async (draftKind) => {
+      const user = userEvent.setup();
+      localStorage.removeItem(RECENT_KEY);
+      useHostFilesystemMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: { entries: [], truncated: false },
+      } as unknown as ReturnType<typeof useHostFilesystem>);
+      renderLanding();
+      const input = screen.getByTestId("new-chat-landing-input");
+      if (draftKind === "message") {
+        fireEvent.change(input, { target: { value: "inspect the repo" } });
+      } else {
+        fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+          target: { files: [new File(["notes"], "notes.txt", { type: "text/plain" })] },
+        });
+      }
+      const reason = "Please choose a host and working directory";
+      expect(screen.queryByText(reason)).not.toBeInTheDocument();
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      const trigger = submit.parentElement!;
+      expect(submit).toBeDisabled();
+      await user.hover(trigger);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+      fireEvent.click(trigger);
+      expect(screen.getByRole("tooltip")).toBeVisible();
+      await user.unhover(trigger);
+      expect(screen.getByRole("tooltip")).toBeVisible();
+      await user.click(input);
+      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+
+      expect(trigger).toHaveAttribute("role", "group");
+      expect(trigger).toHaveAttribute("aria-disabled", "true");
+      expect(trigger).toHaveAttribute("tabindex", "0");
+      act(() => trigger.focus());
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+
+      await user.click(input);
+      await user.keyboard("{Enter}");
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      fireEvent.pointerLeave(trigger, { pointerType: "mouse" });
+      expect(screen.getByRole("tooltip")).toBeVisible();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+      fireEvent.click(screen.getByTestId("new-chat-landing-workspace-open-folder"));
+      const pathInput = screen.getByTestId("workspace-picker-path-input");
+      fireEvent.change(pathInput, { target: { value: "/work/repo" } });
+      fireEvent.keyDown(pathInput, { key: "Enter" });
+      fireEvent.click(screen.getByTestId("workspace-picker-select"));
+      await waitFor(() => expect(submit).toBeEnabled());
+      expect(screen.queryByText(reason)).not.toBeInTheDocument();
+      expect(trigger).toHaveAttribute("tabindex", "-1");
+      expect(trigger).not.toHaveAttribute("aria-disabled");
+    },
+  );
+
+  it.each(["{Enter}", "[Space]"])(
+    "pins the explanation with %s on the wrapper and hands focus to Start when ready",
+    async (key) => {
+      const user = userEvent.setup();
+      renderLanding();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveTextContent("repo"),
+      );
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      const trigger = submit.parentElement!;
+      act(() => trigger.focus());
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+      await user.keyboard(key);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(
+        "Enter a message to get started",
+      );
+      expect(trigger).toHaveFocus();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "inspect the repo" },
+      });
+      expect(submit).toBeEnabled();
+      expect(submit).toHaveFocus();
+      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+    },
+  );
+
   it("shows the default shortcut in the new-chat submit tooltip", async () => {
     renderLanding();
     await waitFor(() =>
@@ -11738,6 +11828,39 @@ describe("managed sandbox gateway preview", () => {
       sandbox_provider_capabilities: { arclet: { default_models: true } },
     });
   }
+
+  it.each([
+    ["high", "high"],
+    ["xhigh", undefined],
+  ])(
+    "seeds project effort %s against the gateway model's ladder",
+    async (projectEffort, sentEffort) => {
+      preview();
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      useProjectsMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: [{ id: "proj_alpha", name: "Alpha" }],
+      });
+      useProjectConfigMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: { agent_id: "a2", model: astra.id, effort: projectEffort },
+      });
+      renderLanding(
+        {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "arclet",
+          sandbox_provider_capabilities: { arclet: { default_models: true } },
+        },
+        "/?project=Alpha",
+      );
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBe(astra.id);
+      expect(body.reasoning_effort).toBe(sentEffort);
+    },
+  );
 
   it("offers gateway models without a host and carries Codex model and effort into create", async () => {
     preview();

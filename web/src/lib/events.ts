@@ -997,6 +997,11 @@ export interface BrowserActionRequestEvent {
   args: Record<string, unknown>;
 }
 
+export interface UiOpenFileEvent {
+  type: "ui_open_file";
+  path: string;
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -1056,4 +1061,5 @@ export type StreamEvent =
   | SessionModelOptionsEvent
   | SessionPresenceEvent
   | SessionBtwSidechatEvent
-  | BrowserActionRequestEvent;
+  | BrowserActionRequestEvent
+  | UiOpenFileEvent;

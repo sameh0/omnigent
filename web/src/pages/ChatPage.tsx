@@ -206,7 +206,8 @@ import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
-import { isBrandHarness, useHostMcpServers } from "@/hooks/useHarnessInventory";
+import { isBrandHarness, useHostMcpServers, type HostMcpServer } from "@/hooks/useHarnessInventory";
+import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
 import {
   getSessionHost,
   sessionRoutingHostId,
@@ -214,6 +215,7 @@ import {
 } from "@/lib/sessionHost";
 import { HostBadge } from "@/components/HostBadge";
 import {
+  type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
   matchSlashCommandInvocation,
@@ -238,6 +240,7 @@ import {
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { useSandboxLaunchModelOptions } from "@/hooks/useSandboxModelOptions";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { buildFusionSections } from "@/components/composer/fusionSections";
@@ -345,6 +348,12 @@ export function isSubagentRoutingEligible(
 ): boolean {
   return smartRoutingEnabled(serverInfo) && isSubagentRoutingSession(session);
 }
+
+/** How often `/mcp` re-reads the host inventory while a server waits on a sign-in. */
+const HOST_MCP_SIGN_IN_POLL_MS = 5_000;
+
+/** Only an http(s) page is ever opened from a host's sign-in report. */
+const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
 
 // Leading whitespace + the command token, so the composer overlay can tint
 // just the `/command` or `$skill` and leave args in the default color.
@@ -872,17 +881,40 @@ export function ChatPage() {
       hostProbeHarness !== null &&
       sessionModelOptions.length === 0,
   );
-  // Identity-stable on purpose: substitute only when the host rows actually
-  // exist, else keep the store's own array reference — a fresh [] here would
-  // re-render every options consumer (composer, gear, agent-info popover) on
-  // each streaming/liveness tick.
+  // A launching sandbox has no host to probe until it is bound, so fall back to
+  // its provider's preview for the harnesses sandboxes run.
+  const sandboxPreviewHarness =
+    fallbackPickerKind === "claude"
+      ? "claude-native"
+      : fallbackPickerKind === "codex"
+        ? "codex-native"
+        : fallbackPickerKind === "pi"
+          ? "pi-native"
+          : null;
+  const sandboxPreviewOptions = useSandboxLaunchModelOptions(
+    sandboxStatus,
+    activeSession?.hostId ?? null,
+    sandboxPreviewHarness,
+    activeSession?.agentId ?? null,
+    !activeSession?.inferenceConfigured &&
+      sandboxPreviewHarness !== null &&
+      sessionModelOptions.length === 0,
+  );
+  const preLaunchOptions =
+    hostProbeOptions != null && hostProbeOptions.length > 0
+      ? hostProbeOptions
+      : sandboxPreviewOptions;
+  // Keep the store's array reference unless pre-launch rows exist: a fresh []
+  // would re-render every options consumer on each streaming/liveness tick.
   const codexModelOptions =
     !activeSession?.inferenceConfigured &&
     sessionModelOptions.length === 0 &&
-    hostProbeOptions != null &&
-    hostProbeOptions.length > 0
-      ? hostProbeOptions
+    preLaunchOptions != null &&
+    preLaunchOptions.length > 0
+      ? preLaunchOptions
       : sessionModelOptions;
+  const modelsFromLaunchPreview =
+    sandboxPreviewOptions !== undefined && codexModelOptions === sandboxPreviewOptions;
 
   // The session is unreachable and a message can't wake it: the host is
   // offline (host-bound) or it isn't host-bound and the runner is down.
@@ -907,10 +939,12 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
+  const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
   const { reconnect, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
     useSessionReconnect({
       sessionId: urlConvId ?? null,
-      hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
+      hostId: reconnectHostId,
+      hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
       isOwner: isOwnerLevel(permissionLevel),
     });
 
@@ -1176,6 +1210,7 @@ export function ChatPage() {
       codexModelOptions={codexModelOptions}
       inferenceConfigured={activeSession?.inferenceConfigured}
       inferenceError={activeSession?.inferenceError}
+      modelsFromLaunchPreview={modelsFromLaunchPreview}
       modelLabelOptions={sessionModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
@@ -1336,6 +1371,8 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
+  /** The rows are a launching sandbox's preview, so a pick has no runner to confirm it. */
+  modelsFromLaunchPreview?: boolean;
   /** Session catalog for display labels; host-probe rows remain menu-only. */
   modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
@@ -1501,6 +1538,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   codexModelOptions,
   inferenceConfigured,
   inferenceError,
+  modelsFromLaunchPreview,
   modelLabelOptions,
   showCodexPlanMode,
   showClaudePermissionMode = false,
@@ -1817,6 +1855,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             codexModelOptions={codexModelOptions}
             inferenceConfigured={inferenceConfigured}
             inferenceError={inferenceError}
+            modelsFromLaunchPreview={modelsFromLaunchPreview}
             modelLabelOptions={modelLabelOptions}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
@@ -1945,6 +1984,8 @@ interface ComposerProps {
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
+  /** The rows are a launching sandbox's preview, so a pick has no runner to confirm it. */
+  modelsFromLaunchPreview?: boolean;
   /** Session catalog for display labels; host-probe rows remain menu-only. */
   modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
@@ -2043,6 +2084,7 @@ export function buildSlashCommandMap(
   skillPrefix: "/" | "$" = "/",
   supportsModelReset = false,
   showMcp = false,
+  showClear = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2050,6 +2092,7 @@ export function buildSlashCommandMap(
     if (name === "/model" && !showModel) continue;
     if (name === "/compact" && !showCompact) continue;
     if (name === "/mcp" && !showMcp) continue;
+    if (name === "/clear" && !showClear) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -2305,6 +2348,7 @@ function ComposerImpl(
     codexModelOptions,
     inferenceConfigured,
     inferenceError,
+    modelsFromLaunchPreview,
     modelLabelOptions = codexModelOptions,
     showCodexPlanMode,
     showClaudePermissionMode = false,
@@ -2510,11 +2554,22 @@ function ComposerImpl(
   );
   const hostMcpRoutingId =
     sessionRoutingHostId(composerSession?.hostId, composerSession?.labels) ?? inheritedHostId;
+  // Poll while a host server awaits sign-in: the user completes it elsewhere.
   const hostMcpQuery = useHostMcpServers(
     hostMcpRoutingId,
     mcpPanelRequested && hostMcpHarness !== null,
+    useCallback(
+      (servers: HostMcpServer[] | undefined) =>
+        servers?.some(
+          (server) =>
+            server.harness === hostMcpHarness && server.auth_status === "sign_in_required",
+        )
+          ? HOST_MCP_SIGN_IN_POLL_MS
+          : false,
+      [hostMcpHarness],
+    ),
   );
-  const mcpServersStatus =
+  const hostMcpStatus =
     hostMcpHarness === null
       ? undefined
       : hostMcpRoutingId === null
@@ -2824,6 +2879,9 @@ function ComposerImpl(
   // for claude-sdk, whose runner sends /compact to the live SDK client to
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
+  // /clear runs the harness's own /clear in the session terminal, which moves
+  // the terminal onto a fresh session the view then follows.
+  const showClear = sessionHarness === "claude-native" || sessionHarness === "codex-native";
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -2845,6 +2903,7 @@ function ComposerImpl(
         skillPrefix,
         supportsModelReset,
         composerSessionId !== null,
+        showClear,
       ),
     [
       skills,
@@ -2856,6 +2915,7 @@ function ComposerImpl(
       skillPrefix,
       supportsModelReset,
       composerSessionId,
+      showClear,
     ],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
@@ -3064,6 +3124,26 @@ function ComposerImpl(
         onNewSession();
         return true;
       }
+      case "/clear": {
+        if (!showClear) {
+          setCommandError("/clear is not supported for this agent type");
+          return true;
+        }
+        if (arg) {
+          setCommandError("/clear does not accept arguments");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        void useChatStore
+          .getState()
+          .clearContext()
+          .catch((err: unknown) => {
+            setCommandError(err instanceof Error ? err.message : "Clear failed");
+          });
+        return true;
+      }
       case "/compact": {
         if (!showCompact) {
           setCommandError("/compact is not supported for this agent type");
@@ -3257,8 +3337,35 @@ function ComposerImpl(
   );
   const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
   const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
+  const composerServerInfo = useServerInfo();
+  const registryEnabled =
+    composerServerInfo !== "loading" && !!composerServerInfo.enabled_connections?.includes("mcp");
+  const hasRegistryServers =
+    registryEnabled &&
+    (selectedAgent?.mcp_servers ?? []).some((server) => server.transport === "registry");
+  // Load account state only while `/mcp` shows registry rows.
+  const registryCatalog = useMcpRegistryCatalog(mcpPanelRequested && hasRegistryServers);
+  const registrySignIn = useRegistrySignIn(registryCatalog.refresh);
+  const { signIn: signInToRegistryService, clearError: clearRegistrySignInError } = registrySignIn;
+  const onMcpSignIn = useCallback(
+    (name: string) => {
+      const service = registryCatalog.services.find((s) => s.id === name);
+      if (service) void signInToRegistryService(service);
+    },
+    [registryCatalog.services, signInToRegistryService],
+  );
+  // Both can be true at once (an unreachable host and an unreadable catalog).
+  const mcpServersStatus =
+    [
+      hostMcpStatus,
+      hasRegistryServers && registryCatalog.error
+        ? "Couldn’t check MCP service connections."
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ") || undefined;
   const mcpServers = useMemo(() => {
-    const byName = new Map(
+    const byName = new Map<string, McpServerRow>(
       (hostMcpQuery.data ?? [])
         .filter((server) => server.harness === hostMcpHarness)
         .map((server) => [
@@ -3269,14 +3376,58 @@ function ComposerImpl(
               [server.plugin && `${server.plugin} plugin`, server.url_host]
                 .filter(Boolean)
                 .join(" · ") || undefined,
+            connection:
+              server.auth_status === "connected"
+                ? "connected"
+                : server.auth_status === "sign_in_required"
+                  ? "sign-in-required"
+                  : undefined,
+            // No URL means the state is still worth showing, with nothing to click.
+            // The scheme is enforced host-side and again at the frame decoder; this
+            // is the last gate before it becomes an href.
+            signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
+              ? { kind: "url", url: server.sign_in_url! }
+              : undefined,
           },
         ]),
     );
+    const catalogLoaded = !registryCatalog.loading && !registryCatalog.error;
     for (const server of selectedAgent?.mcp_servers ?? []) {
-      byName.set(server.name, { name: server.name, description: server.description ?? undefined });
+      // A shared name is not a shared endpoint, so an agent server claims none of
+      // the host's account state: its Sign in could point at the wrong service.
+      const row: McpServerRow = {
+        name: server.name,
+        description: server.description ?? byName.get(server.name)?.description,
+      };
+      // Only a read from this open: a stale row would offer a needless popup.
+      if (hasRegistryServers && server.transport === "registry" && catalogLoaded) {
+        const service = registryCatalog.services.find((s) => s.id === server.name);
+        if (service) {
+          row.description = service.description || row.description;
+          row.connection = service.connected ? "connected" : "sign-in-required";
+          if (!service.connected) {
+            // A token or workspace URL has to be typed, which the panel has no room for.
+            row.signIn =
+              service.auth === "bearer" || service.auth === "databricks"
+                ? { kind: "settings", href: "/settings/mcp" }
+                : { kind: "inline" };
+          }
+        } else {
+          row.connection = "unavailable";
+        }
+      }
+      byName.set(server.name, row);
     }
     return [...byName.values()];
-  }, [hostMcpHarness, hostMcpQuery.data, selectedAgent?.mcp_servers]);
+  }, [
+    hasRegistryServers,
+    hostMcpHarness,
+    hostMcpQuery.data,
+    registryCatalog.error,
+    registryCatalog.loading,
+    registryCatalog.services,
+    selectedAgent?.mcp_servers,
+  ]);
 
   const slashCompletionCommands = mcpPanelRequested
     ? { "/mcp": BUILTIN_SLASH_COMMANDS["/mcp"]! }
@@ -3300,6 +3451,11 @@ function ComposerImpl(
     clearText: () => setValue(""),
   });
   const showMcpServers = mcpPanelRequested && !slashCompletion.inline;
+  // Clear on both edges: a popup that rejects after the panel closes would
+  // otherwise greet the next open with a stale message.
+  useEffect(() => {
+    clearRegistrySignInError();
+  }, [showMcpServers, clearRegistrySignInError]);
 
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   // Growth stays in the flex column so the transcript viewport ends where the
@@ -3903,6 +4059,13 @@ function ComposerImpl(
                   mcpServers={mcpServers}
                   mcpServersStatus={mcpServersStatus}
                   mcpSettingsHref={mcpSettingsHref}
+                  onMcpSignIn={onMcpSignIn}
+                  mcpAuthorizingName={registrySignIn.authorizing}
+                  mcpSignInError={
+                    registrySignIn.error
+                      ? { name: registrySignIn.error.id, message: registrySignIn.error.message }
+                      : null
+                  }
                 />
               )}
               {/* "@"-file-mention browser — native coding-agent sessions only.
@@ -4090,6 +4253,7 @@ function ComposerImpl(
                   codexModelOptions={codexModelOptions}
                   inferenceConfigured={inferenceConfigured}
                   inferenceError={inferenceError}
+                  modelsFromLaunchPreview={modelsFromLaunchPreview}
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
@@ -4730,6 +4894,7 @@ function SessionHarnessPicker({
   codexModelOptions,
   inferenceConfigured,
   inferenceError,
+  modelsFromLaunchPreview,
   modelLabelOptions,
   modelLabelHostId,
   costRoutingEligible,
@@ -4750,6 +4915,7 @@ function SessionHarnessPicker({
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
+  modelsFromLaunchPreview?: boolean;
   modelLabelOptions: readonly NativeModelOption[];
   modelLabelHostId: string | null | undefined;
   costRoutingEligible: boolean;
@@ -4853,7 +5019,8 @@ function SessionHarnessPicker({
       const store = useChatStore.getState();
       const sourceSessionId = store.conversationId;
       await store.setModel(modelId, {
-        expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
+        expectConfirmation:
+          (modelPickerKind === "claude" || modelPickerKind === "codex") && !modelsFromLaunchPreview,
       });
       if (useChatStore.getState().conversationId !== sourceSessionId) return;
       if (
