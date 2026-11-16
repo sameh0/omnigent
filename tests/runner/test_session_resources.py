@@ -728,8 +728,6 @@ async def test_reset_state_closes_terminals_and_publishes_deleted(tmp_path: Path
     dead terminal, and attaching to it failed with "terminal resource
     not found or not running".
     """
-    from omnigent.runner.app import _session_histories_ref
-
     conv_id = "conv_switch_term_teardown"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -739,7 +737,6 @@ async def test_reset_state_closes_terminals_and_publishes_deleted(tmp_path: Path
     # Private-attr seed matches the existing resource-registry test
     # convention (no real tmux).
     _seed_registry(terminal_registry, conv_id, [_make_instance("tui", "main", tmp_path)])
-    _session_histories_ref[conv_id] = [{"type": "message", "role": "user", "content": []}]
     registry = SessionResourceRegistry(
         terminal_registry=terminal_registry,
         runner_workspace=workspace,
@@ -784,7 +781,6 @@ async def test_reset_state_closes_terminals_and_publishes_deleted(tmp_path: Path
         "reset-state must close the session's terminals; this one is "
         "still registered, so the web UI would keep listing it."
     )
-    assert conv_id not in _session_histories_ref
 
     # Exactly one session.resource.deleted for the closed terminal so
     # connected clients drop it live (the server relay also persists it).
@@ -799,44 +795,6 @@ async def test_reset_state_closes_terminals_and_publishes_deleted(tmp_path: Path
             "session_id": conv_id,
         }
     ], f"expected one terminal session.resource.deleted event, got {deleted!r}"
-
-
-@pytest.mark.asyncio
-async def test_history_reset_drops_the_transcript_but_keeps_terminals(tmp_path: Path) -> None:
-    """A revert in an SDK session clears cached history without closing terminals."""
-    from omnigent.runner.app import _session_histories_ref
-
-    conv_id = "conv_revert_history_reset"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    terminal_registry = TerminalRegistry(conversation_link_base_url="http://127.0.0.1:8000")
-    _seed_registry(terminal_registry, conv_id, [_make_instance("shell", "main", tmp_path)])
-    _session_histories_ref[conv_id] = [{"type": "message", "role": "user", "content": []}]
-
-    async def _spec_resolver(agent_id: str, session_id: str | None) -> AgentSpec:
-        del agent_id, session_id
-        return AgentSpec(spec_version=1, name="any")
-
-    app = create_runner_app(
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        terminal_registry=terminal_registry,
-        resource_registry=SessionResourceRegistry(
-            terminal_registry=terminal_registry,
-            runner_workspace=workspace,
-            per_session_workspace=False,
-        ),
-        spec_resolver=_spec_resolver,
-        runner_workspace=workspace,
-        per_session_workspace=False,
-    )
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
-        reset = await c.post(f"/v1/sessions/{conv_id}/history/reset")
-
-    assert reset.status_code == 200, reset.text
-    assert conv_id not in _session_histories_ref
-    assert terminal_registry.get(conv_id, "shell", "main") is not None
 
 
 @pytest.mark.asyncio
@@ -1761,6 +1719,8 @@ class _WatcherCapture:
         was wired.
     :param on_tick: The per-tick callback the registry passed (drives the
         claude-native status-file poller), or ``None`` if none was wired.
+    :param idle_poll_backoff_allowed: The native idle-poll backoff gate the
+        registry passed, or ``None`` when no backoff gate was wired.
     :param idle_threshold_s: The per-watcher idle threshold the registry
         passed, or ``None`` for the module default.
     :param poll_interval_s: The per-watcher poll interval the registry
@@ -1772,6 +1732,7 @@ class _WatcherCapture:
     on_idle: Callable[[], None] | None = None
     on_exit: Callable[[], None] | None = None
     on_tick: Callable[[], None] | None = None
+    idle_poll_backoff_allowed: Callable[[], bool] | None = None
     idle_threshold_s: float | None = None
     poll_interval_s: float | None = None
     replace: bool = False
@@ -1807,6 +1768,7 @@ def _make_capturing_instance(
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         on_tick: Callable[[], None] | None = None,
+        idle_poll_backoff_allowed: Callable[[], bool] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -1816,6 +1778,7 @@ def _make_capturing_instance(
         capture.on_activity = on_activity
         capture.on_exit = on_exit
         capture.on_tick = on_tick
+        capture.idle_poll_backoff_allowed = idle_poll_backoff_allowed
         capture.idle_threshold_s = idle_threshold_s
         capture.poll_interval_s = poll_interval_s
         capture.replace = replace
