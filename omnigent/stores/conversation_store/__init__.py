@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -16,6 +16,11 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.stores.conversation_store.activity_error import (
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
+)
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
 # Pending inputs share the item store, but are not harness transcript history yet.
 PENDING_INPUT_RESPONSE_ID = "pending_input"
@@ -49,9 +54,10 @@ FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 # ``external_session_id`` is still NULL. Cleared/ignored thereafter.
 FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY = "omnigent.fork.source_external_session_id"
 
-# Native-history replay directive used by forks, agent switches, and in-place
-# rewinds. A native CLI ignores the Omnigent transcript, so the runner rebuilds
-# the target's on-disk transcript before launch. Two rebuild paths share it:
+# Fork directive: set when the fork binds a NATIVE target harness
+# (claude-native / codex-native) whose history should carry over. A native
+# CLI ignores the Omnigent transcript, so the runner rebuilds the target's
+# on-disk transcript before launch. Two rebuild paths share this directive:
 # when the source was a SAME-FAMILY native session its captured
 # ``external_session_id`` is also stamped (see
 # FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) and the runner clones that
@@ -179,6 +185,20 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 # Server-owned origin, retained when a schedule's run history is deleted.
 SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
 SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_source_sha256"
+# Server-owned: the automation run this session serves, set before each run's
+# prompt is sent. Journal entries the session records are attributed to it.
+SCHEDULED_TASK_RUN_LABEL_KEY = "omnigent.scheduled_task_run"
+SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY = "omnigent.scheduled_task_initial_run"
+SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX = "omnigent.pending_scheduled_run."
+# The run whose agent has appended real activity; copied history never sets it.
+SCHEDULED_TASK_ACTIVITY_LABEL_KEY = "omnigent.scheduled_task_activity"
+
+# Server-owned: marks the copy an automation starts each run from (its source
+# session). The value is the task id; runs never inherit it.
+SCHEDULED_TASK_SOURCE_LABEL_KEY = "omnigent.scheduled_task_source"
+
+# Compare-and-swap rounds swap_label tries before giving up on a contended label.
+_LABEL_SWAP_ATTEMPTS = 5
 
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
@@ -211,20 +231,16 @@ def family_pinned_label_key(user_id: str | None) -> str:
 #     typed re-confirmation and no banner, violating the "impossible to
 #     enable accidentally" contract (#657). Dropping it forces each session
 #     that runs bypass to make its own explicit opt-in.
-_RUNTIME_INSTANCE_LABEL_KEYS = frozenset(
+_INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
-        "omnigent.antigravity_native.bridge_id",
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
-        "omnigent.opencode_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
         "omnigent.startup",
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
-_INSTANCE_SCOPED_LABEL_KEYS = _RUNTIME_INSTANCE_LABEL_KEYS | {
-    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
-}
 
 # Source identity belongs only to the original imported session, and a fork is
 # born unarchived so it must not inherit its parent's archive time. The sandbox
@@ -247,11 +263,22 @@ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
+    # A fork of an automation's copy isn't what the automation runs from.
+    SCHEDULED_TASK_SOURCE_LABEL_KEY,
+    # Closing seals only that child (a stopped side chat, a closed sub-agent);
+    # forking it is how the user continues it as a session of its own.
+    CLOSED_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
+    # A truncated fork's newest item differs; its next append recomputes it.
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
 }
 
 
@@ -267,6 +294,14 @@ class CreatedSession:
 
     conversation: Conversation
     agent: Agent
+
+
+@dataclass(frozen=True)
+class SessionTodosUpdate:
+    """An accepted native task snapshot and the state it atomically replaced."""
+
+    id: str
+    previous: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -328,6 +363,24 @@ class SessionConnectivity:
 
 
 @dataclass(frozen=True)
+class SpawnTreeUsage:
+    """
+    One spawn-tree member's place in the tree and its own recorded usage.
+
+    Returned by :meth:`ConversationStore.list_spawn_tree_usage` for cost
+    roll-ups that need neither labels nor content.
+
+    :param id: Conversation id.
+    :param parent_conversation_id: Parent id, or ``None`` for the root.
+    :param session_usage: This conversation's own ``session_usage`` document.
+    """
+
+    id: str
+    parent_conversation_id: str | None
+    session_usage: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class SessionActivity:
     """
     When a session last changed and what it is doing now.
@@ -344,6 +397,8 @@ class SessionActivity:
     :param pending_elicitation_count: Current unresolved session approvals/questions;
         ``None`` when not reported.
     :param runner_id: Bound runner, or ``None`` for an in-process session.
+    :param archived: Whether the session is archived; ``None`` when the store
+        doesn't report it.
     """
 
     updated_at: int
@@ -351,6 +406,7 @@ class SessionActivity:
     total_cost_usd: float | None = None
     pending_elicitation_count: int | None = None
     runner_id: str | None = None
+    archived: bool | None = None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
@@ -391,10 +447,6 @@ class ConversationNotFoundError(Exception):
 
 class ConversationAlreadyExistsError(Exception):
     """Raised when a caller-supplied conversation id is already in use."""
-
-
-class ConversationChangedError(Exception):
-    """Raised when a conversation gained items after the caller last checked it."""
 
 
 class NameAlreadyExistsError(Exception):
@@ -912,6 +964,11 @@ class ConversationStore(ABC):
         of inserting a duplicate. The existence check rides the append's
         own transaction, so idempotency costs no extra query.
 
+        Implementations should fold the inserted items into the
+        ``LATEST_ACTIVITY_ERROR_LABEL_KEY`` label with
+        :func:`~omnigent.stores.conversation_store.activity_error.fold_activity_error`
+        in the same write. The label is maintained on append only.
+
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :param items: List of :class:`NewConversationItem` objects
@@ -1352,6 +1409,85 @@ class ConversationStore(ABC):
         """
         ...
 
+    def replace_label_if(
+        self,
+        conversation_id: str,
+        key: str,
+        *,
+        expected: str | None,
+        value: str | None,
+    ) -> bool:
+        """
+        Change one label only while it still holds *expected*.
+
+        Lets a writer undo its own label without clobbering a later writer's.
+        This default reads then writes, which is enough for stores without
+        concurrent writers; SQL stores override it with one conditional write.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key, e.g. ``"omnigent.scheduled_task_run"``.
+        :param expected: The value the label must still hold, or ``None`` for
+            a label that must still be absent.
+        :param value: The new value, or ``None`` to delete the label.
+        :returns: Whether the label held *expected* and was changed.
+        :raises ValueError: If *expected* and *value* are both ``None``.
+        """
+        if expected is None and value is None:
+            raise ValueError("replace_label_if needs an expected value or a new value")
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None or conversation.labels.get(key) != expected:
+            return False
+        if value is None:
+            self.delete_label(conversation_id, key)
+        else:
+            self.set_labels(conversation_id, {key: value})
+        return True
+
+    def swap_label(self, conversation_id: str, key: str, value: str) -> str | None:
+        """
+        Set one label and return the value it replaced.
+
+        Built on :meth:`replace_label_if`, so the returned value is the one the
+        write actually replaced even while other writers change the label.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key, e.g. ``"omnigent.scheduled_task_run"``.
+        :param value: The new value.
+        :returns: The label's previous value, or ``None`` if it had none.
+        :raises RuntimeError: If other writers kept changing the label.
+        """
+        for _ in range(_LABEL_SWAP_ATTEMPTS):
+            conversation = self.get_conversation(conversation_id)
+            previous = conversation.labels.get(key) if conversation is not None else None
+            if self.replace_label_if(conversation_id, key, expected=previous, value=value):
+                return previous
+        raise RuntimeError(f"label {key!r} on {conversation_id!r} kept changing")
+
+    def update_scheduled_run_label(
+        self,
+        conversation_id: str,
+        run_id: str,
+        *,
+        action: Literal["begin", "commit", "rollback"],
+    ) -> None:
+        """Begin or settle a continued run's tentative session attribution.
+
+        A rollback removes this attempt from the pending chain even if another
+        attempt replaced it. A commit retains it as a valid predecessor once
+        sending may have begun. Each operation must be atomic across replicas.
+        """
+        raise NotImplementedError
+
+    def clear_scheduled_run_label(
+        self, conversation_id: str, run_id: str, *, pending_run_finished: bool = False
+    ) -> bool:
+        """End a human's inherited attribution without clearing a newer dispatch.
+
+        A pending dispatch is retained unless its run is terminal or its stamp
+        has exceeded the scheduler's stale-run window.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def list_projects(
         self,
@@ -1431,8 +1567,8 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         todos: list[dict[str, Any]],
-    ) -> bool:
-        """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
+    ) -> SessionTodosUpdate | None:
+        """Persist the Plan snapshot and return its update; missing metadata returns None."""
         raise NotImplementedError
 
     def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
@@ -1823,6 +1959,7 @@ class ConversationStore(ABC):
         *,
         expected_runner_id: str | None = None,
         expected_binding: Conversation | None = None,
+        expected_runner: Conversation | None = None,
     ) -> Conversation:
         """
         Replace ``conversations.runner_id`` for a conversation.
@@ -1845,6 +1982,9 @@ class ConversationStore(ABC):
             return the current conversation unchanged. None means unconditional.
         :param expected_binding: Require its runner and host to match the current binding.
             A mismatch raises ValueError before any write.
+        :param expected_runner: Require its runner (``None`` included) to still be the
+            current one, whatever the host is now. A mismatch raises ValueError
+            before any write.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
@@ -1853,7 +1993,11 @@ class ConversationStore(ABC):
 
     @abstractmethod
     def clear_runner_id(
-        self, conversation_id: str, *, expected_binding: Conversation | None = None
+        self,
+        conversation_id: str,
+        *,
+        expected_binding: Conversation | None = None,
+        expected_runner: Conversation | None = None,
     ) -> Conversation:
         """
         Null out ``conversations.runner_id``.
@@ -1868,6 +2012,9 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param expected_binding: Require its runner and host to match the current binding.
             A mismatch raises ValueError before any write.
+        :param expected_runner: Require its runner (``None`` included) to still be
+            the current one, whatever the host is now. A mismatch raises
+            ValueError before any write.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
@@ -1881,6 +2028,8 @@ class ConversationStore(ABC):
         *,
         expected_host_id: str | None = None,
         expected_sandbox_id: str | None = None,
+        expected_runner_id: str | None = None,
+        keep_runner: bool = False,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -1906,6 +2055,10 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param expected_host_id: When supplied, clear only if the current host
             still matches this identity; otherwise leave every binding field unchanged.
+        :param expected_runner_id: When supplied, clear only if the current
+            runner is still this one; otherwise leave every binding field unchanged.
+        :param keep_runner: Leave ``runner_id`` in place and clear only the
+            host fields, e.g. so a move keeps its claim while it detaches.
         :param clear_profile: Allow detaching a profiled session from a live host.
             When false, that binding is left unchanged. Accepted profile labels are retained.
         :returns: The current :class:`Conversation` after the conditional clear.
@@ -2033,6 +2186,36 @@ class ConversationStore(ABC):
             has_more=page.has_more,
         )
 
+    def list_spawn_tree_usage(
+        self, root_conversation_id: str, *, limit: int
+    ) -> PagedList[SpawnTreeUsage]:
+        """Read one spawn tree's hierarchy and usage in a single bounded read.
+
+        Like :meth:`list_spawn_tree` but without labels or other row data, so
+        *limit* bounds all the work. ``has_more`` means the tree holds more
+        than *limit* rows; rows come in id order.
+
+        :param root_conversation_id: Root of the spawn tree.
+        :param limit: Maximum conversations to return.
+        :returns: The tree's members with their parent and own usage.
+        """
+        page = self.list_conversations(
+            limit=limit,
+            kind=None,
+            include_archived=True,
+            root_conversation_id=root_conversation_id,
+            order="asc",
+            sort_by="id",
+        )
+        return PagedList(
+            data=[
+                SpawnTreeUsage(c.id, c.parent_conversation_id, c.session_usage) for c in page.data
+            ],
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
+        )
+
     @abstractmethod
     def list_conversations_by_runner_id(
         self,
@@ -2063,13 +2246,15 @@ class ConversationStore(ABC):
         host_id: str,
         workspace: str | None = None,
         git_branch: str | None = None,
+        *,
+        expected_runner_id: str | None = None,
     ) -> Conversation:
         """
         Set the host that launched (or should launch) the runner.
 
         Used when the server asks a host to spawn a runner for
         an existing session. Last-write-wins semantics (like
-        :meth:`replace_runner_id`).
+        :meth:`replace_runner_id`) unless *expected_runner_id* is set.
 
         Runner/host binding is live state, not conversation activity, so
         this must NOT bump ``updated_at`` (it drives sidebar ordering
@@ -2091,9 +2276,14 @@ class ConversationStore(ABC):
             worktree (the fork resume path). ``None`` preserves the
             branch on the same host/workspace, but clears it when
             the host or an explicitly supplied workspace changes.
+        :param expected_runner_id: Bind only while the session's runner is
+            still this one and it has no other host, checked atomically with
+            the write, e.g. the claim a move holds on the session.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
+        :raises ValueError: If *expected_runner_id* is set and the session
+            has another runner or another host.
         """
         ...
 
@@ -2208,33 +2398,6 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def rewind_conversation(
-        self,
-        conversation_id: str,
-        *,
-        before_item_id: str,
-        expected_last_item_id: str | None = None,
-        carry_history_into_native: bool = False,
-    ) -> Conversation:
-        """Delete a selected item and everything after it in the same session.
-
-        Resets the native runtime identity so a supported native harness
-        rebuilds from the retained Agent Platform items on its next launch.
-
-        :param conversation_id: Session to rewind, e.g. ``"conv_abc123"``.
-        :param before_item_id: First item to delete, e.g. ``"msg_def456"``.
-        :param expected_last_item_id: The newest item the caller saw. When set,
-            the rewind refuses to run if a later item was appended since.
-        :param carry_history_into_native: Whether to mark the retained items for
-            native transcript replay.
-        :returns: The updated conversation with the same id.
-        :raises LookupError: If the conversation or cutoff item does not exist.
-        :raises ConversationChangedError: If ``expected_last_item_id`` is no
-            longer the newest item.
-        """
-        ...
-
-    @abstractmethod
     def fork_conversation(
         self,
         source_conversation_id: str,
@@ -2246,6 +2409,7 @@ class ConversationStore(ABC):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        copy_inference_snapshot: bool = True,
         override_model_override: str | None = None,
         override_model_override_set: bool = False,
         override_reasoning_effort: str | None = None,
@@ -2260,6 +2424,7 @@ class ConversationStore(ABC):
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        copy_journal: bool = True,
         continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
@@ -2307,6 +2472,10 @@ class ConversationStore(ABC):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param copy_inference_snapshot: When ``True`` (default), the fork
+            keeps the source's saved provider binding. When ``False``, it has
+            none and resolves its provider like a new session: used when the
+            fork binds another agent, whose provider may differ.
         :param copy_terminal_launch_args: When ``True`` (default), copy the
             source's ``terminal_launch_args``. When ``False``, the fork starts
             with none — used when the fork switches to a different CLI, where
@@ -2375,6 +2544,9 @@ class ConversationStore(ABC):
         :param copy_items: ``False`` copies no items at all, whatever the
             source holds when the fork commits, e.g. for ``/clear``. A
             truncation; exclusive with both cutoffs.
+        :param copy_journal: ``False`` leaves the source's journal behind, so
+            the fork starts with none, e.g. an automation run's copy of its
+            source session, which plans its own work.
         :param continue_source: Also copy the source's host, workspace and
             branch (in the same write that creates the fork), its routing
             switches and its workspace-file sharing, for a same-owner
