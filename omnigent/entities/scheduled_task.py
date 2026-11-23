@@ -44,7 +44,7 @@ class ScheduledTask:
 
     A task's trigger is a required recurring ``rrule``.
 
-    :param id: UUID primary key (bare 32-char hex string, no dashes).
+    :param id: Primary key from the store's allocator; by default a bare 32-char hex UUID.
     :param workspace_id: Tenant partition key that owns this row.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
@@ -98,9 +98,10 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
-    :param kind: ``"automation"``, or ``"reminder"`` for a one-time message an
-        agent set for its own session. Clients list reminders apart from
-        automations; scheduling and firing ignore it.
+    :param kind: ``"automation"``, ``"reminder"`` for a one-time message an
+        agent set for its own session, or ``"timer"`` for a wake an agent set with
+        ``sys_timer_set``. Clients list both apart from automations, and only a
+        timer is scheduled and fired differently.
     """
 
     id: str
@@ -147,8 +148,8 @@ class ScheduledTaskRun:
     table.
 
     :param id: UUID primary key (bare 32-char hex string, no dashes).
-    :param scheduled_task_id: The task this run belongs to (a bare 32-char hex
-        UUID string).
+    :param scheduled_task_id: The ID of the task this run belongs to; by default a
+        bare 32-char hex UUID.
     :param status: Lifecycle state — one of ``"scheduled"``, ``"starting"``, ``"running"``,
         ``"succeeded"``, ``"failed"``, ``"skipped"``.
     :param scheduled_at: Unix epoch seconds. Persistent dispatch records the
